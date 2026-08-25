@@ -22,7 +22,7 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		return false, err
 	}
 	defer func() { _ = sctx.DB.SetRunPushActive(sctx.Run.ID, false) }()
-	baseBranch := effectivePRBaseBranch(sctx)
+	baseBranch := runTargetBranch(sctx)
 	if pr != nil && strings.TrimSpace(pr.BaseBranch) != "" {
 		baseBranch = strings.TrimSpace(pr.BaseBranch)
 	}

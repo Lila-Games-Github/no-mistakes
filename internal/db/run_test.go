@@ -1,11 +1,46 @@
 package db
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestRunTargetBranchPersistsAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "runs.db")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRunWithOptions(repo.ID, "feature", "abc123", "def456", RunOptions{
+		TargetBranch: "proto/godot/frog-pile",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	got, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TargetBranch == nil || *got.TargetBranch != "proto/godot/frog-pile" {
+		t.Fatalf("target branch after reopen = %v, want proto/godot/frog-pile", got.TargetBranch)
+	}
+}
 
 func TestRunInsertAndGet(t *testing.T) {
 	d := openTestDB(t)

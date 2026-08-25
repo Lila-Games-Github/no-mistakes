@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS runs (
     branch               TEXT NOT NULL,
     head_sha                TEXT NOT NULL,
     base_sha                TEXT NOT NULL,
+    target_branch           TEXT,
     worktree_dir            TEXT,
     submitted_head_sha      TEXT,
     no_mistakes_version     TEXT,
@@ -188,6 +189,10 @@ var migrationStatements = []string{
 	// Branch synchronization provenance is intentionally nullable. Historical
 	// rows stay unbound because mutable head_sha cannot prove a successful push.
 	`ALTER TABLE runs ADD COLUMN submitted_head_sha TEXT`,
+	// TargetBranch is nullable only for runs created before explicit per-run
+	// targeting existed. New runs pin their resolved integration branch before
+	// execution so recovery never re-derives it from mutable configuration.
+	`ALTER TABLE runs ADD COLUMN target_branch TEXT`,
 	// The directory this run's worktree was created in. It is durable because
 	// placement comes from operator configuration (worktree_roots) that may be
 	// edited while a run exists: recording it makes such an edit inert for

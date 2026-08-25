@@ -106,6 +106,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			targetBranch := parseTargetBranchPushOptions(pushOptions)
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -124,12 +125,13 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 
 			var result ipc.PushReceivedResult
 			return client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
-				Gate:      gatePath,
-				Ref:       ref,
-				Old:       oldSHA,
-				New:       newSHA,
-				SkipSteps: skipSteps,
-				Intent:    intent,
+				Gate:         gatePath,
+				Ref:          ref,
+				Old:          oldSHA,
+				New:          newSHA,
+				TargetBranch: targetBranch,
+				SkipSteps:    skipSteps,
+				Intent:       intent,
 			}, &result)
 		},
 	}
@@ -193,6 +195,29 @@ func parseSkipSteps(value string) ([]types.StepName, error) {
 // The value is base64-encoded so multi-line or special-character intents
 // survive the push-option transport (which is line-oriented).
 const intentPushOptionPrefix = "no-mistakes.intent="
+
+const targetBranchPushOptionPrefix = "no-mistakes.target-branch="
+
+func formatTargetBranchPushOption(targetBranch string) string {
+	targetBranch = strings.TrimSpace(targetBranch)
+	if targetBranch == "" {
+		return ""
+	}
+	return targetBranchPushOptionPrefix + targetBranch
+}
+
+// parseTargetBranchPushOptions extracts the last explicit target. Validation
+// belongs to the daemon's run-creation boundary; notify-push only preserves the
+// push option byte-for-byte across the IPC hop.
+func parseTargetBranchPushOptions(options []string) string {
+	targetBranch := ""
+	for _, option := range options {
+		if value, ok := strings.CutPrefix(option, targetBranchPushOptionPrefix); ok {
+			targetBranch = value
+		}
+	}
+	return targetBranch
+}
 
 // formatIntentPushOption encodes intent as a single push option, or returns ""
 // when there is no intent to carry.

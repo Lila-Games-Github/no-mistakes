@@ -414,14 +414,15 @@ func TestPRStep_CreatesNewPR(t *testing.T) {
 	}
 }
 
-func TestPRStep_UsesConfiguredBaseBranch(t *testing.T) {
+func TestPRStep_UsesDurableRunTargetBranch(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	env, logFile := fakeGH(t, "")
 
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
-	sctx.Config.PR.BaseBranch = "develop"
+	sctx.Run.TargetBranch = stringPtr("develop")
+	sctx.Config.PR.BaseBranch = "main"
 
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
 		t.Fatal(err)
@@ -438,7 +439,7 @@ func TestPRStep_UsesConfiguredBaseBranch(t *testing.T) {
 		t.Fatalf("expected PR lookup not to filter by base branch (would miss an existing PR opened against a different base), got:\n%s", logData)
 	}
 	if !strings.Contains(string(logData), "pr create --head feature --base develop") {
-		t.Fatalf("expected configured base branch in PR creation, got:\n%s", logData)
+		t.Fatalf("expected durable target branch in PR creation, got:\n%s", logData)
 	}
 }
 

@@ -162,6 +162,101 @@ func TestPushReceivedSkipStepsConfiguresExecutor(t *testing.T) {
 	}
 }
 
+func TestPushReceivedPersistsExplicitTargetBranch(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+	repo, _ := setupTestGitRepo(t, p, d, "target-branch-run-repo")
+
+	const target = "proto/godot/frog-pile"
+	gitCmd(t, repo.WorkingPath, "checkout", "-b", target)
+	if err := os.WriteFile(filepath.Join(repo.WorkingPath, "integration.txt"), []byte("integration\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.WorkingPath, "add", "integration.txt")
+	gitCmd(t, repo.WorkingPath, "commit", "-m", "integration")
+	gitCmd(t, repo.WorkingPath, "push", "gate", target)
+
+	const feature = "feature/targeted"
+	gitCmd(t, repo.WorkingPath, "checkout", "-b", feature)
+	if err := os.WriteFile(filepath.Join(repo.WorkingPath, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.WorkingPath, "add", "feature.txt")
+	gitCmd(t, repo.WorkingPath, "commit", "-m", "feature")
+	headSHA := gitOutput(t, repo.WorkingPath, "rev-parse", "HEAD")
+	gitCmd(t, repo.WorkingPath, "push", "gate", feature)
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate:         p.RepoDir(repo.ID),
+		Ref:          "refs/heads/" + feature,
+		Old:          strings.Repeat("0", 40),
+		New:          headSHA,
+		TargetBranch: target,
+	}, &result); err != nil {
+		t.Fatal(err)
+	}
+	got := waitForRunTerminalState(t, d, result.RunID)
+	if got.TargetBranch == nil || *got.TargetBranch != target {
+		t.Fatalf("stored target branch = %v, want %s", got.TargetBranch, target)
+	}
+	var rerun ipc.RerunResult
+	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{RepoID: repo.ID, Branch: feature}, &rerun); err != nil {
+		t.Fatal(err)
+	}
+	recovered := waitForRunTerminalState(t, d, rerun.RunID)
+	if recovered.TargetBranch == nil || *recovered.TargetBranch != target {
+		t.Fatalf("rerun target branch = %v, want inherited %s", recovered.TargetBranch, target)
+	}
+}
+
+func TestPushReceivedMissingExplicitTargetFailsLoudly(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+	repo, headSHA := setupTestGitRepo(t, p, d, "missing-target-run-repo")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate:         p.RepoDir(repo.ID),
+		Ref:          "refs/heads/feature/missing-target",
+		Old:          strings.Repeat("0", 40),
+		New:          headSHA,
+		TargetBranch: "does/not/exist",
+	}, &result)
+	if err == nil {
+		t.Fatal("expected missing explicit target to fail")
+	}
+	for _, want := range []string{`target branch "does/not/exist"`, "does not exist on the upstream repository"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing-target error does not contain %q: %v", want, err)
+		}
+	}
+}
+
+func TestValidateExplicitTargetForBranchRejectsRetargetingFeature(t *testing.T) {
+	if err := validateExplicitTargetForBranch("feature/x", "develop"); err != nil {
+		t.Fatalf("different integration target rejected: %v", err)
+	}
+	if err := validateExplicitTargetForBranch("refs/heads/feature/x", "feature/x"); err == nil || !strings.Contains(err.Error(), "feature branch being validated") {
+		t.Fatalf("same-branch target error = %v, want actionable rejection", err)
+	}
+	if err := validateExplicitTargetForBranch("feature/x", "main..release"); err == nil || !strings.Contains(err.Error(), "invalid target branch") {
+		t.Fatalf("ambiguous target error = %v, want validation rejection", err)
+	}
+}
+
 func TestPushReceivedAllowsDifferentBranchRunsConcurrently(t *testing.T) {
 	started := make(chan string, 2)
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {

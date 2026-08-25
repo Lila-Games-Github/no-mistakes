@@ -94,7 +94,7 @@ func TestRebaseStep_ConflictTriesAllTargets(t *testing.T) {
 	}
 }
 
-func TestRebaseStep_UsesConfiguredPRBaseBranch(t *testing.T) {
+func TestRebaseStep_UsesDurableRunTargetBranch(t *testing.T) {
 	t.Parallel()
 	upstream := t.TempDir()
 	gitCmd(t, upstream, "init", "--bare")
@@ -138,8 +138,9 @@ func TestRebaseStep_UsesConfiguredPRBaseBranch(t *testing.T) {
 
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, developSHA, headSHA, config.Commands{})
 	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Run.TargetBranch = stringPtr("develop")
 	sctx.Repo.UpstreamURL = upstream
-	sctx.Config.PR.BaseBranch = "develop"
+	sctx.Config.PR.BaseBranch = "main"
 
 	outcome, err := (&RebaseStep{}).Execute(sctx)
 	if err != nil {
@@ -149,10 +150,10 @@ func TestRebaseStep_UsesConfiguredPRBaseBranch(t *testing.T) {
 		t.Fatalf("unexpected approval: %s", outcome.Findings)
 	}
 	if got := gitCmd(t, dir, "merge-base", "HEAD", "origin/develop"); got != developSHA {
-		t.Fatalf("merge-base with configured base = %s, want develop %s", got, developSHA)
+		t.Fatalf("merge-base with durable run target = %s, want develop %s", got, developSHA)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "main.txt")); !os.IsNotExist(err) {
-		t.Fatal("rebase used forge default main instead of configured develop")
+		t.Fatal("rebase used mutable config/default main instead of durable run target develop")
 	}
 }
 

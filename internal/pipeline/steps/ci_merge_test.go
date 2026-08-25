@@ -329,6 +329,7 @@ func TestCIStep_AutoFixUsesExistingPRBaseAfterConfigChanges(t *testing.T) {
 	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Repo.UpstreamURL = "https://github.com/test/repo.git"
 	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Run.TargetBranch = stringPtr("release/stale-run-target")
 	sctx.Config.PR.BaseBranch = "main"
 	sctx.Config.AutoFix = config.AutoFix{CI: 1}
 	pr := &scm.PR{Number: "42", URL: "https://github.com/test/repo/pull/42", BaseBranch: "develop"}

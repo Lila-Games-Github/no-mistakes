@@ -27,6 +27,60 @@ func IsZeroSHA(sha string) bool {
 	return sha == "0000000000000000000000000000000000000000"
 }
 
+// NormalizeBranchName trims and validates one short Git branch name. Full
+// refs, revision expressions, and Git's reserved or ambiguous spellings are
+// rejected so callers can safely build the exact
+// refs/heads/<name> they intend to resolve.
+func NormalizeBranchName(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", fmt.Errorf("branch name is empty")
+	}
+	if strings.HasPrefix(trimmed, "refs/") {
+		return "", fmt.Errorf("give a branch name, not a full ref")
+	}
+	if strings.HasPrefix(trimmed, "-") {
+		return "", fmt.Errorf("must not start with %q", "-")
+	}
+	if trimmed == "@" || trimmed == "HEAD" {
+		return "", fmt.Errorf("%q is reserved by Git", trimmed)
+	}
+	if strings.HasPrefix(trimmed, "/") || strings.HasSuffix(trimmed, "/") {
+		return "", fmt.Errorf("must not start or end with %q", "/")
+	}
+	if strings.HasSuffix(trimmed, ".") {
+		return "", fmt.Errorf("must not end with %q", ".")
+	}
+	if strings.Contains(trimmed, "..") {
+		return "", fmt.Errorf("must not contain %q", "..")
+	}
+	if strings.Contains(trimmed, "@{") {
+		return "", fmt.Errorf("must not contain %q", "@{")
+	}
+	for _, r := range trimmed {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return "", fmt.Errorf("must not contain control characters")
+		case r == ' ':
+			return "", fmt.Errorf("must not contain spaces")
+		case strings.ContainsRune("~^:?*[\\", r):
+			return "", fmt.Errorf("must not contain %q", string(r))
+		}
+	}
+	for _, component := range strings.Split(trimmed, "/") {
+		if component == "" {
+			return "", fmt.Errorf("must not contain an empty path component")
+		}
+		if strings.HasPrefix(component, ".") {
+			return "", fmt.Errorf("path component %q must not start with %q", component, ".")
+		}
+		if strings.HasSuffix(component, ".lock") {
+			return "", fmt.Errorf("path component %q must not end with %q", component, ".lock")
+		}
+	}
+	return trimmed, nil
+}
+
 // Run executes a git command in the given directory and returns trimmed stdout.
 // Returns an error that includes the command and stderr on failure.
 //

@@ -35,6 +35,12 @@ asks for something specific, translate that request into the matching `axi run`
 flags yourself - for example, "skip the lint step" becomes `--skip=lint`. Run
 `no-mistakes axi run --help` to see the available flags.
 
+When the user's feature branch is based on a non-default integration branch,
+translate that requirement into `--target-branch <branch>`. The daemon resolves the
+exact upstream branch and stores it on the run so every pre-PR scope stage and
+new PR creation use the same target across restart, recovery, and rerun. Omit
+the flag to use the repository's configured `pr.base_branch` or default branch.
+
 ## Two ways to invoke
 
 `/no-mistakes` works in two modes, depending on whether the user hands you a
@@ -252,10 +258,10 @@ The CI step deliberately keeps watching the PR after checks pass, so
 blocking on the human merge. Never poll or re-run waiting for the merge yourself.
 Never treat "no CI checks reported" alone as green.
 
-Because that monitor stays live, a PR that falls behind the default branch or
+Because that monitor stays live, a PR that falls behind its base branch or
 hits a merge conflict after checks pass - commonly because another PR merged
 first - needs **no command from you**: never hand-rebase. When the CI monitor
-sees an actual conflict it **rebases onto the base, resolves it, restarts
+sees an actual conflict it **rebases onto that forge-reported base, resolves it, restarts
 validation at Review, and re-pushes the branch through Push**; a PR that is merely behind but still clean needs nothing
 either, since the platform merges it. The one exception is when that monitor is
 no longer running - the PR was closed, the run was aborted or superseded, it
