@@ -68,7 +68,7 @@ func publishRunEvidence(sctx *pipeline.StepContext) *evidenceLinks {
 		Segments:          segments,
 		SourceDir:         sourceDir,
 		Message:           fmt.Sprintf("no-mistakes: evidence for %s (run %s)", branch, sctx.Run.ID),
-		ForbiddenBranches: []string{branch, sctx.Repo.DefaultBranch},
+		ForbiddenBranches: []string{branch, runTargetBranch(sctx), sctx.Repo.DefaultBranch},
 	})
 	if err != nil {
 		sctx.Log(fmt.Sprintf("test evidence not published, linking local paths instead: %v", err))

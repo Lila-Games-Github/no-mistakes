@@ -100,6 +100,31 @@ func TestFormatIntentPushOptionEmpty(t *testing.T) {
 	}
 }
 
+func TestTargetBranchPushOptionRoundTrip(t *testing.T) {
+	const target = "proto/godot/frog-pile"
+	option := formatTargetBranchPushOption(target)
+	if option != "no-mistakes.target-branch="+target {
+		t.Fatalf("formatTargetBranchPushOption() = %q", option)
+	}
+	got := parseTargetBranchPushOptions([]string{
+		"no-mistakes.target-branch=old-integration",
+		"no-mistakes.skip=test",
+		option,
+	})
+	if got != target {
+		t.Fatalf("parseTargetBranchPushOptions() = %q, want %q", got, target)
+	}
+}
+
+func TestTargetBranchPushOptionAbsent(t *testing.T) {
+	if got := parseTargetBranchPushOptions([]string{"no-mistakes.skip=test"}); got != "" {
+		t.Fatalf("parseTargetBranchPushOptions() = %q, want empty", got)
+	}
+	if got := formatTargetBranchPushOption("   "); got != "" {
+		t.Fatalf("formatTargetBranchPushOption(blank) = %q, want empty", got)
+	}
+}
+
 func TestParseIntentPushOptionsNone(t *testing.T) {
 	got, err := parseIntentPushOptions([]string{"no-mistakes.skip=test", "ci.skip"})
 	if err != nil {

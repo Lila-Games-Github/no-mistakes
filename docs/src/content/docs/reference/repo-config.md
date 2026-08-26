@@ -177,7 +177,8 @@ A feature branch cannot self-declare `no_ci: true` to bypass checks, and cannot 
 
 ### pr.base_branch
 
-Select the branch that newly created pull requests target.
+Select the integration branch a run uses when the caller does not pass
+`axi run --target-branch`.
 
 | | |
 | --- | --- |
@@ -185,12 +186,13 @@ Select the branch that newly created pull requests target.
 | Default | The repository's forge default branch |
 | Trust | Trusted default branch, unless `allow_repo_commands: true` is explicitly enabled there |
 
-Use this when the repository's integration branch differs from its forge default branch, for example `develop` instead of `main`.
-The configured branch is used for PR creation, and as the integration base for the rebase step.
+Use this as the repository-wide default when the integration branch differs from its forge default branch, for example `develop` instead of `main`.
+The selected branch is stored on each new run and used by intent matching, rebase, review, test, document, lint, and PR creation.
+An explicit `axi run --target-branch <branch>` takes precedence for that run without changing repository configuration.
 When unset, no-mistakes preserves the existing behavior and targets `Repo.DefaultBranch`.
 
 PR lookup matches an existing PR by branch alone, never filtered by base, so a `pr.base_branch` change after a PR was opened updates that PR instead of opening a duplicate against the new base.
-Once a PR exists, its actual forge base branch is authoritative over `pr.base_branch` for the CI step's merge-conflict auto-fix and base-branch tip monitoring, protecting a resumed run from a configuration change made after the PR was created.
+Once a PR exists, its actual forge base branch is authoritative over both the run's stored target and `pr.base_branch` for the CI step's merge-conflict auto-fix and base-branch tip monitoring.
 
 Because this setting controls where a PR lands, a pushed branch cannot redirect its own PR target by changing `pr.base_branch`.
 It is read from the trusted default-branch copy regardless of `allow_repo_commands` by default.

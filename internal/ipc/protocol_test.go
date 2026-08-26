@@ -125,11 +125,12 @@ func TestResponseError(t *testing.T) {
 
 func TestPushReceivedParams(t *testing.T) {
 	params := PushReceivedParams{
-		Gate:      "/path/to/gate.git",
-		Ref:       "refs/heads/main",
-		Old:       "aaa",
-		New:       "bbb",
-		SkipSteps: []types.StepName{types.StepTest, types.StepLint},
+		Gate:         "/path/to/gate.git",
+		Ref:          "refs/heads/main",
+		Old:          "aaa",
+		New:          "bbb",
+		TargetBranch: "proto/godot/frog-pile",
+		SkipSteps:    []types.StepName{types.StepTest, types.StepLint},
 	}
 	data, _ := json.Marshal(params)
 	var got PushReceivedParams
@@ -141,6 +142,9 @@ func TestPushReceivedParams(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.SkipSteps, params.SkipSteps) {
 		t.Errorf("skip_steps = %+v, want %+v", got.SkipSteps, params.SkipSteps)
+	}
+	if got.TargetBranch != params.TargetBranch {
+		t.Errorf("target_branch = %q, want %q", got.TargetBranch, params.TargetBranch)
 	}
 }
 
@@ -181,7 +185,7 @@ func TestGetActiveRunParams(t *testing.T) {
 }
 
 func TestRerunParams(t *testing.T) {
-	params := RerunParams{RepoID: "repo456", Branch: "feature", PreviousRunID: "run123", SkipSteps: []types.StepName{types.StepReview}}
+	params := RerunParams{RepoID: "repo456", Branch: "feature", PreviousRunID: "run123", TargetBranch: "develop", SkipSteps: []types.StepName{types.StepReview}}
 	data, _ := json.Marshal(params)
 	var got RerunParams
 	if err := json.Unmarshal(data, &got); err != nil {
@@ -195,6 +199,9 @@ func TestRerunParams(t *testing.T) {
 	}
 	if got.PreviousRunID != "run123" {
 		t.Errorf("previous_run_id = %q, want %q", got.PreviousRunID, "run123")
+	}
+	if got.TargetBranch != "develop" {
+		t.Errorf("target_branch = %q, want develop", got.TargetBranch)
 	}
 	if len(got.SkipSteps) != 1 || got.SkipSteps[0] != types.StepReview {
 		t.Errorf("skip_steps = %#v, want review", got.SkipSteps)

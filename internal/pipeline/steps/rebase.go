@@ -28,7 +28,7 @@ const forkBranchRefPrefix = "refs/remotes/no-mistakes-push/"
 func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 	ctx := sctx.Ctx
 	branch := strings.TrimPrefix(sctx.Run.Branch, "refs/heads/")
-	defaultBranch := effectivePRBaseBranch(sctx)
+	defaultBranch := runTargetBranch(sctx)
 	branchTarget := ""
 	pushRemote := resolveUpstreamURL(sctx)
 	if branch != "" {
@@ -166,12 +166,18 @@ func forcePushRebaseTargets(branch, defaultBranch string) []string {
 	return []string{"origin/" + defaultBranch}
 }
 
-// effectivePRBaseBranch resolves the branch used as the integration base for
-// rebases. The repository default remains the fallback for configurations that
-// do not select a separate PR target branch.
-func effectivePRBaseBranch(sctx *pipeline.StepContext) string {
-	defaultBranch := strings.TrimSpace(sctx.Repo.DefaultBranch)
-	if sctx.Config != nil && strings.TrimSpace(sctx.Config.PR.BaseBranch) != "" {
+// runTargetBranch resolves the integration branch every pre-PR scope consumer
+// must use. New runs carry an immutable durable target; the config/default
+// fallback remains only for historical runs recorded before that field existed.
+func runTargetBranch(sctx *pipeline.StepContext) string {
+	if sctx != nil && sctx.Run != nil && sctx.Run.TargetBranch != nil && strings.TrimSpace(*sctx.Run.TargetBranch) != "" {
+		return strings.TrimSpace(*sctx.Run.TargetBranch)
+	}
+	defaultBranch := ""
+	if sctx != nil && sctx.Repo != nil {
+		defaultBranch = strings.TrimSpace(sctx.Repo.DefaultBranch)
+	}
+	if sctx != nil && sctx.Config != nil && strings.TrimSpace(sctx.Config.PR.BaseBranch) != "" {
 		defaultBranch = strings.TrimSpace(sctx.Config.PR.BaseBranch)
 	}
 	if defaultBranch == "" {
@@ -527,7 +533,7 @@ func updateHeadSHA(ctx context.Context, sctx *pipeline.StepContext) (*pipeline.S
 
 	// Check if the branch has any diff against the default branch.
 	// If the diff is empty (e.g. branch was already merged), skip remaining steps.
-	defaultBranch := effectivePRBaseBranch(sctx)
+	defaultBranch := runTargetBranch(sctx)
 	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, defaultBranch)
 	diff, err := git.Diff(ctx, sctx.WorkDir, baseSHA, "HEAD")
 	if err == nil && strings.TrimSpace(diff) == "" {

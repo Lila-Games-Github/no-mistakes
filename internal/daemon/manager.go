@@ -710,7 +710,25 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
-	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent)
+	if err := validateExplicitTargetForBranch(branch, params.TargetBranch); err != nil {
+		return "", err
+	}
+	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent, params.TargetBranch)
+}
+
+func validateExplicitTargetForBranch(branch, targetBranch string) error {
+	rawTarget := strings.TrimSpace(targetBranch)
+	if rawTarget == "" {
+		return nil
+	}
+	targetBranch, err := git.NormalizeBranchName(rawTarget)
+	if err != nil {
+		return fmt.Errorf("invalid target branch %q: %w", rawTarget, err)
+	}
+	if strings.TrimPrefix(branch, "refs/heads/") == targetBranch {
+		return fmt.Errorf("target branch %q is the feature branch being validated; select its upstream integration branch", targetBranch)
+	}
+	return nil
 }
 
 // HandleRerun creates a new run for the latest recoverable head on a branch:
@@ -718,7 +736,10 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 // head while custody remains outstanding. An explicit intent overrides the
 // selected run. Otherwise an authoritative intent is inherited byte-for-byte;
 // runs without one infer intent afresh.
-func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID string, skipSteps []types.StepName, intent string) (string, error) {
+func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID, targetBranch string, skipSteps []types.StepName, intent string) (string, error) {
+	if err := validateExplicitTargetForBranch(branch, targetBranch); err != nil {
+		return "", err
+	}
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get repo: %w", err)
@@ -787,8 +808,13 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 			intentSource = db.RunIntentSourceRerun
 		}
 	}
+	if strings.TrimSpace(targetBranch) == "" && selectedRun.TargetBranch != nil {
+		// A rerun inherits the selected run's immutable integration target. An
+		// explicit target supplied by a new axi run is the only override.
+		targetBranch = *selectedRun.TargetBranch
+	}
 
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource)
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, targetBranch)
 }
 
 func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Run) (string, error) {
@@ -832,31 +858,31 @@ func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Ru
 	return "", fmt.Errorf("refusing rerun from stale gate head %s: terminal run %s recorded unpublished head %s, but that head is unavailable; inspect with `no-mistakes axi status` and reconcile custody first", gateHead, latest.ID, latest.HeadSHA)
 }
 
-// fetchRunDefaultBranch fetches the trusted branch from the refreshed
+// fetchRunUpstreamBranch fetches one parent-repository branch from the refreshed
 // registration when it differs from the gate worktree's inherited origin. It
 // updates only the run worktree's existing origin tracking ref and never
 // rewrites clone or gate remote configuration. When the values agree after
 // redaction, origin remains authoritative so embedded credentials retained in
 // the gate can still authenticate without ever entering the database.
-func fetchRunDefaultBranch(ctx context.Context, workDir string, repo *db.Repo) error {
+func fetchRunUpstreamBranch(ctx context.Context, workDir string, repo *db.Repo, branch string) error {
 	originURL, err := git.GetRemoteURL(ctx, workDir, "origin")
 	if !repo.URLsVerified || (err == nil && safeurl.Redact(originURL) == repo.UpstreamURL) {
-		return git.FetchRemoteBranch(ctx, workDir, "origin", repo.DefaultBranch)
+		return git.FetchRemoteBranch(ctx, workDir, "origin", branch)
 	}
-	return git.FetchRemoteBranchToRef(ctx, workDir, repo.UpstreamURL, repo.DefaultBranch, "refs/remotes/origin/"+repo.DefaultBranch)
+	return git.FetchRemoteBranchToRef(ctx, workDir, repo.UpstreamURL, branch, "refs/remotes/origin/"+branch)
 }
 
 // startRun creates a run, sets up a worktree, and launches pipeline execution.
 // A non-empty intent is stamped onto the run as agent-supplied, so the intent
 // step uses it instead of inferring from transcripts.
-func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string) (string, error) {
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent)
+func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, targetBranch string) (string, error) {
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, targetBranch)
 }
 
 // startRunWithIntentSource is the common run-creation path. source is empty
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
-func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string) (string, error) {
+func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, targetBranch string) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -870,6 +896,16 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	if m.shuttingDown.Load() {
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
+	}
+
+	targetBranch = strings.TrimSpace(targetBranch)
+	if targetBranch != "" {
+		normalized, err := git.NormalizeBranchName(targetBranch)
+		if err != nil {
+			trackStartFailure("invalid_target_branch")
+			return "", fmt.Errorf("invalid target branch %q: %w", targetBranch, err)
+		}
+		targetBranch = normalized
 	}
 
 	// Serialize per repo+branch to prevent two concurrent pushes from both
@@ -906,7 +942,10 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		runIntent = &db.RunIntent{Summary: storedIntent, Source: source, Score: 1}
 	}
 
-	run, err := m.db.InsertRunWithIntent(repo.ID, branch, headSHA, baseSHA, runIntent)
+	run, err := m.db.InsertRunWithOptions(repo.ID, branch, headSHA, baseSHA, db.RunOptions{
+		Intent:       runIntent,
+		TargetBranch: targetBranch,
+	})
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
@@ -978,7 +1017,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	// branch has already removed - silently running stale shell.
 	var trustedSHA string
 	if repo.DefaultBranch != "" {
-		fetchErr := fetchRunDefaultBranch(ctx, wtDir, repo)
+		fetchErr := fetchRunUpstreamBranch(ctx, wtDir, repo, repo.DefaultBranch)
 		if fetchErr != nil {
 			slog.Warn("failed to fetch default branch into worktree; trusted config disabled (commands/agent from pushed branch will be dropped)", "run_id", run.ID, "branch", repo.DefaultBranch, "error", fetchErr)
 		} else if sha, err := git.ResolveRef(ctx, wtDir, "refs/remotes/origin/"+repo.DefaultBranch); err != nil {
@@ -1027,6 +1066,52 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		slog.Info("repo commands/agent loaded from default branch, not pushed branch", "run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch)
 	}
 	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	selectedTarget := targetBranch
+	if selectedTarget == "" {
+		selectedTarget = strings.TrimSpace(cfg.PR.BaseBranch)
+	}
+	if selectedTarget == "" {
+		selectedTarget = strings.TrimSpace(repo.DefaultBranch)
+	}
+	selectedTarget, err = git.NormalizeBranchName(selectedTarget)
+	if err != nil {
+		err = fmt.Errorf("resolve run target branch %q: %w", selectedTarget, err)
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("invalid_target_branch")
+		return "", err
+	}
+	// The default branch was fetched above on a best-effort basis to preserve
+	// legacy startup behavior. An explicitly selected target has a stricter
+	// contract: even when it names the default branch, fetch it authoritatively
+	// here so a missing or unreachable explicit target cannot reuse a stale ref.
+	if selectedTarget != repo.DefaultBranch || targetBranch != "" {
+		if err := fetchRunUpstreamBranch(ctx, wtDir, repo, selectedTarget); err != nil {
+			err = fmt.Errorf("target branch %q does not exist on the upstream repository or could not be fetched: %w", selectedTarget, err)
+			m.db.UpdateRunError(run.ID, err.Error())
+			trackStartFailure("fetch_target_branch")
+			return "", err
+		}
+	}
+	targetRef := "refs/remotes/origin/" + selectedTarget
+	targetSHA, err := git.ResolveRef(ctx, wtDir, targetRef)
+	if err != nil {
+		err = fmt.Errorf("target branch %q did not resolve to one exact upstream commit: %w", selectedTarget, err)
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("resolve_target_branch")
+		return "", err
+	}
+	if _, err := git.Run(ctx, wtDir, "merge-base", headSHA, targetSHA); err != nil {
+		err = fmt.Errorf("target branch %q has no common history with feature branch %q", selectedTarget, strings.TrimPrefix(branch, "refs/heads/"))
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("target_branch_history")
+		return "", err
+	}
+	if err := m.db.SetRunTargetBranch(run.ID, selectedTarget); err != nil {
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("persist_target_branch")
+		return "", err
+	}
+	run.TargetBranch = &selectedTarget
 	if err := m.paths.ValidateEvidenceRoot(cfg.Test.Evidence.LocalRoot); err != nil {
 		m.db.UpdateRunError(run.ID, err.Error())
 		trackStartFailure("evidence_root")

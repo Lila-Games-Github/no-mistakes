@@ -98,19 +98,27 @@ An active run on another branch does not block starting validation for the curre
 
 ```sh
 no-mistakes axi run --intent "the user's goal"
+no-mistakes axi run --intent "the user's goal" --target-branch proto/godot/frog-pile
 no-mistakes axi run --intent "the user's goal" --skip test,lint
 no-mistakes axi run --intent "the user's goal" --yes
 ```
 
-| Flag          | Type     | Default | Description                                                      |
-| ------------- | -------- | ------- | ---------------------------------------------------------------- |
-| `--intent`    | `string` | (none)  | What the user set out to accomplish; required to start a new run |
-| `-y`, `--yes` | `bool`   | `false` | Auto-resolve every gate until a decision point or outcome        |
-| `--skip`      | `string` | (none)  | Comma-separated pipeline steps to skip                           |
+| Flag              | Type     | Default | Description                                                                    |
+| ----------------- | -------- | ------- | ------------------------------------------------------------------------------ |
+| `--intent`        | `string` | (none)  | What the user set out to accomplish; required to start a new run               |
+| `--target-branch` | `string` | (none)  | Upstream integration branch for comparison, rebase, validation, and new PR base |
+| `-y`, `--yes`     | `bool`   | `false` | Auto-resolve every gate until a decision point or outcome                      |
+| `--skip`          | `string` | (none)  | Comma-separated pipeline steps to skip                                         |
 
 `--intent` is not a description of the diff.
 It is the user's goal or request, and no-mistakes uses it verbatim instead of transcript inference.
 Err on the side of completeness: include the goal, important decisions and tradeoffs, constraints or approaches ruled in or out, and explicit requests that might otherwise look surprising in the diff.
+`--target-branch` accepts one short branch name from the registered upstream repository, not a tag, revision expression, or full `refs/heads/...` ref.
+Use it when the feature was forked from a non-default integration branch and this run must review only that delta.
+The daemon fetches and resolves the exact upstream branch, fails the run when it is missing or has no common history with the feature, and stores the selected branch durably before pipeline execution.
+That stored target is used consistently by intent matching, rebase, review, test, document, lint, and new PR creation; daemon restart, recovery, and rerun inherit it rather than re-reading mutable configuration.
+When omitted, [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) is selected when configured, otherwise the repository default branch is selected, preserving existing behavior.
+If a PR already exists, post-PR CI monitoring and conflict repair continue to trust the forge PR's actual base branch.
 When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
 Reattaching to an in-flight run does not require `--intent`.
 Reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
@@ -127,7 +135,7 @@ Long-running `axi run` calls are working, not stalled; if one returns a `gate:`,
 Backgrounding a call is fine for an agent harness, but the run never advances past a gate on its own.
 When the CI step is still monitoring an open PR and checks are green - or the trusted default-branch config declares [`no_ci: true`](/no-mistakes/reference/repo-config/#no_ci) with no registered checks - `axi run` exits successfully with `outcome: checks-passed` instead of waiting for a human merge. A generic empty check list without that declaration is not ready.
 Treat that as the agent stopping point: ask the user to review and merge the PR from the `help` line.
-If that PR later falls behind the default branch or hits a merge conflict, do not run `axi run`, `rerun`, or a manual rebase while the CI monitor is still running.
+If that PR later falls behind its base branch or hits a merge conflict, do not run `axi run`, `rerun`, or a manual rebase while the CI monitor is still running.
 The monitor auto-rebases onto the base, resolves actual conflicts, restarts validation at Review, and re-pushes the branch through Push; a PR that is merely behind but clean needs no command.
 Use `no-mistakes rerun` only after that monitor is no longer running, such as a closed PR, aborted or superseded run, idle timeout, or exhausted CI auto-fix attempts.
 Successful outcomes (`checks-passed` and `passed`) also carry `help` instructions telling the agent to summarize the run.
@@ -330,6 +338,8 @@ records the transcript source. If another run is active on that branch, rerun
 cancels it before starting over. Treat rerun as a between-runs action after a
 failed or cancelled outcome, or after you have committed a separate fix outside
 an active run; do not use it to bypass a gate.
+Rerun also inherits the selected prior run's durable target branch, so recovery
+cannot silently switch an integration-branch run back to the repository default.
 
 | Flag | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |

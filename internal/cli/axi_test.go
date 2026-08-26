@@ -84,10 +84,11 @@ func TestTruncateDisclosesTotal(t *testing.T) {
 
 func TestWriteRunObjectShape(t *testing.T) {
 	rv := runView{
-		ID:      "run-1",
-		Branch:  "feature/x",
-		Status:  string(types.RunRunning),
-		HeadSHA: "abcdef1234567890",
+		ID:           "run-1",
+		Branch:       "feature/x",
+		TargetBranch: "develop",
+		Status:       string(types.RunRunning),
+		HeadSHA:      "abcdef1234567890",
 		Steps: []stepView{
 			{Name: "review", Status: "completed", DurationMS: 1200, FindingsJSON: findingsJSON(t, []types.Finding{{ID: "r1", Action: types.ActionNoOp, Description: "ok"}}, "s")},
 			{Name: "test", Status: "awaiting_approval"},
@@ -99,6 +100,7 @@ func TestWriteRunObjectShape(t *testing.T) {
 		"run:\n",
 		"  id: run-1\n",
 		"  branch: feature/x\n",
+		"  target_branch: develop\n",
 		"  status: running\n",
 		"  head: abcdef12\n",
 		"  findings: 1 info\n",
@@ -496,12 +498,43 @@ func TestConfigErrorForFreshAxiRunAllowsReattach(t *testing.T) {
 }
 
 func TestRerunParamsIncludeSkipSteps(t *testing.T) {
-	params := rerunParams("repo-1", "feature/x", []types.StepName{types.StepReview}, "user goal")
+	params := rerunParams("repo-1", "feature/x", []types.StepName{types.StepReview}, "user goal", "develop")
 	if params.RepoID != "repo-1" || params.Branch != "feature/x" || params.Intent != "user goal" {
 		t.Fatalf("unexpected rerun params: %#v", params)
 	}
 	if len(params.SkipSteps) != 1 || params.SkipSteps[0] != types.StepReview {
 		t.Fatalf("SkipSteps = %#v, want review", params.SkipSteps)
+	}
+	if params.TargetBranch != "develop" {
+		t.Fatalf("TargetBranch = %q, want develop", params.TargetBranch)
+	}
+}
+
+func TestAxiRunRejectsAmbiguousTargetRevisionBeforeStarting(t *testing.T) {
+	cmd := newAxiRunCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--intent", "user goal", "--target-branch", "main..release"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected ambiguous target revision to fail")
+	}
+	got := out.String()
+	for _, want := range []string{"invalid --target-branch", "short upstream branch name", "must not contain"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("target validation output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestAxiRunHelpDocumentsTargetBranch(t *testing.T) {
+	cmd := newAxiRunCmd()
+	if cmd.Flags().Lookup("target-branch") == nil {
+		t.Fatal("axi run is missing --target-branch")
+	}
+	for _, want := range []string{"rebase, review scope, validation context, and new PR base", "stored on the run", "pr.base_branch"} {
+		if !strings.Contains(cmd.Long, want) {
+			t.Errorf("axi run help missing %q:\n%s", want, cmd.Long)
+		}
 	}
 }
 
@@ -826,7 +859,7 @@ func TestAxiRunReportsInvalidGlobalConfig(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
 	cmd.SetOut(&out)
-	if err := runAxiRun(cmd, false, nil, "user goal"); err == nil {
+	if err := runAxiRun(cmd, false, nil, "user goal", ""); err == nil {
 		t.Fatalf("axi run should fail on invalid global config:\n%s", out.String())
 	}
 	got := out.String()

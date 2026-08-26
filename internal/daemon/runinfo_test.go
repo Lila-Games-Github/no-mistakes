@@ -40,6 +40,26 @@ func TestRunToInfoIncludesImmutableSubmittedHead(t *testing.T) {
 	}
 }
 
+func TestRunToInfoIncludesDurableTargetBranch(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	repo, err := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRunWithOptions(repo.ID, "feature", "head", "base", db.RunOptions{TargetBranch: "develop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := runToInfo(d, run, nil)
+	if info.TargetBranch == nil || *info.TargetBranch != "develop" {
+		t.Fatalf("IPC target branch = %v, want develop", info.TargetBranch)
+	}
+}
+
 func TestStepToInfoIncludesFixSummaries(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

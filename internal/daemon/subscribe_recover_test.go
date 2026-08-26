@@ -510,7 +510,7 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	}
 	defer d.Close()
 	repo, headSHA := setupTestGitRepo(t, p, d, "resume-parked-run")
-	run, err := d.InsertRun(repo.ID, "main", headSHA, headSHA)
+	run, err := d.InsertRunWithOptions(repo.ID, "main", headSHA, headSHA, db.RunOptions{TargetBranch: "proto/godot/frog-pile"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,6 +607,9 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	}
 	if completed.ReviewApprovedHeadSHA == nil || *completed.ReviewApprovedHeadSHA != headSHA {
 		t.Fatalf("recovered review approval = %#v, want %s", completed.ReviewApprovedHeadSHA, headSHA)
+	}
+	if completed.TargetBranch == nil || *completed.TargetBranch != "proto/godot/frog-pile" {
+		t.Fatalf("recovered target branch = %v, want proto/godot/frog-pile", completed.TargetBranch)
 	}
 	// The executor marks the run terminal before its owner goroutine performs
 	// worktree cleanup. Wait for that cleanup rather than assuming it completed

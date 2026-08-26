@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -972,6 +973,113 @@ func TestAxiAgentJourney(t *testing.T) {
 	}
 	if autoRun := h.WaitForRun("feature/axi-yes", 60*time.Second); autoRun.Status != types.RunCompleted {
 		t.Fatalf("feature/axi-yes run status = %s, want completed", autoRun.Status)
+	}
+}
+
+// TestAxiRunExplicitTargetBranch reproduces the integration-branch scope
+// explosion end to end. The feature is one file on top of a twelve-file
+// integration baseline; main would review all thirteen files, while the
+// explicit target must reach the daemon, durable run record, rebase, and
+// review prompt as the one-file comparison base.
+func TestAxiRunExplicitTargetBranch(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude"})
+	const target = "proto/godot/frog-pile"
+	const feature = "feature/targeted-scope"
+
+	if out, err := h.runGit(context.Background(), h.WorkDir, "checkout", "-b", target, "main"); err != nil {
+		t.Fatalf("create target branch: %v\n%s", err, out)
+	}
+	for i := 0; i < 12; i++ {
+		path := filepath.Join(h.WorkDir, fmt.Sprintf("integration-%02d.txt", i))
+		if err := os.WriteFile(path, []byte("integration baseline\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "add", "-A"); err != nil {
+		t.Fatalf("stage integration baseline: %v\n%s", err, out)
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "commit", "-m", "integration baseline"); err != nil {
+		t.Fatalf("commit integration baseline: %v\n%s", err, out)
+	}
+	targetSHA := strings.TrimSpace(h.WorktreeRefSHA("HEAD"))
+	if out, err := h.runGit(context.Background(), h.WorkDir, "push", "origin", target); err != nil {
+		t.Fatalf("push integration target: %v\n%s", err, out)
+	}
+
+	if out, err := h.runGit(context.Background(), h.WorkDir, "checkout", "main"); err != nil {
+		t.Fatalf("checkout main: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(h.WorkDir, "main-only.txt"), []byte("default divergence\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "add", "main-only.txt"); err != nil {
+		t.Fatalf("stage main divergence: %v\n%s", err, out)
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "commit", "-m", "main divergence"); err != nil {
+		t.Fatalf("commit main divergence: %v\n%s", err, out)
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "push", "origin", "main"); err != nil {
+		t.Fatalf("push main divergence: %v\n%s", err, out)
+	}
+	if out, err := h.Run("init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+
+	if out, err := h.runGit(context.Background(), h.WorkDir, "checkout", "-b", feature, target); err != nil {
+		t.Fatalf("create feature from target: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(h.WorkDir, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "add", "feature.txt"); err != nil {
+		t.Fatalf("stage feature: %v\n%s", err, out)
+	}
+	if out, err := h.runGit(context.Background(), h.WorkDir, "commit", "-m", "targeted feature"); err != nil {
+		t.Fatalf("commit feature: %v\n%s", err, out)
+	}
+	operator := h.AddWorktree(feature)
+
+	mainBase, err := h.runGit(context.Background(), operator, "merge-base", "main", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultDiff, err := h.runGit(context.Background(), operator, "diff", "--name-only", strings.TrimSpace(string(mainBase))+"..HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Fields(string(defaultDiff))); got != 13 {
+		t.Fatalf("default-branch scope = %d files, want 13", got)
+	}
+	targetDiff, err := h.runGit(context.Background(), operator, "diff", "--name-only", target+"..HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(targetDiff)); len(got) != 1 || got[0] != "feature.txt" {
+		t.Fatalf("target-branch scope = %v, want [feature.txt]", got)
+	}
+
+	out, err := h.RunInDir(operator, "axi", "run", "--intent", "validate only the feature delta against the Frogpile integration branch", "--target-branch", target, "--yes", "--skip", "test,document,lint,push,pr,ci")
+	if err != nil {
+		t.Fatalf("targeted axi run: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "outcome: passed") {
+		t.Fatalf("targeted axi run did not pass:\n%s", out)
+	}
+	run := h.WaitForRun(feature, 60*time.Second)
+	if run.TargetBranch == nil || *run.TargetBranch != target {
+		t.Fatalf("durable target branch = %v, want %s", run.TargetBranch, target)
+	}
+	var reviewPrompt string
+	for _, invocation := range h.AgentInvocations() {
+		if strings.Contains(invocation.Prompt, "Review the code changes") {
+			reviewPrompt = invocation.Prompt
+			break
+		}
+	}
+	for _, want := range []string{"base commit: " + targetSHA, "target branch: " + target} {
+		if !strings.Contains(reviewPrompt, want) {
+			t.Errorf("review prompt missing %q:\n%s", want, reviewPrompt)
+		}
 	}
 }
 

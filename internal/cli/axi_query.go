@@ -152,7 +152,7 @@ func configQuietWarning(env *axiEnv) time.Duration {
 }
 
 func startRunHelp() string {
-	return `Run no-mistakes axi run --intent "the user's goal" --yes to validate the current branch`
+	return `Run no-mistakes axi run --intent "the user's goal" [--target-branch <upstream-integration-branch>] --yes to validate the current branch`
 }
 
 func noRunLogsHelp() string {

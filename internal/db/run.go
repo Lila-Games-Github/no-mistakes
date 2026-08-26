@@ -18,6 +18,10 @@ type Run struct {
 	Branch  string
 	HeadSHA string
 	BaseSHA string
+	// TargetBranch is the immutable integration branch selected for this run.
+	// It is nil only for historical runs, whose pipeline keeps the legacy
+	// config/default fallback behavior.
+	TargetBranch *string
 	// WorktreeDir is the directory this run's worktree was created in, resolved
 	// once at run creation from the operator's configured placement (see
 	// internal/worktrees). Every consumer of an existing run's worktree reads
@@ -75,13 +79,13 @@ type Run struct {
 	UpdatedAt       int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, target_branch, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
 }, r *Run) error {
 	return row.Scan(
-		&r.ID, &r.RepoID, &r.Branch, &r.HeadSHA, &r.BaseSHA, &r.WorktreeDir, &r.SubmittedHeadSHA, &r.NoMistakesVersion, &r.NoMistakesBuildSHA, &r.ReviewApprovedHeadSHA, &r.Status,
+		&r.ID, &r.RepoID, &r.Branch, &r.HeadSHA, &r.BaseSHA, &r.TargetBranch, &r.WorktreeDir, &r.SubmittedHeadSHA, &r.NoMistakesVersion, &r.NoMistakesBuildSHA, &r.ReviewApprovedHeadSHA, &r.Status,
 		&r.PRURL, &r.PRState, &r.PRStateObservedAt, &r.CIReadyAt, &r.CIReadyNoCI,
 		&r.LastPushedSHA, &r.PushTargetKind, &r.PushTargetFingerprint, &r.PushRef,
 		&r.LastPushedAt, &r.PushGeneration, &r.PushActive, &r.TerminalHeadVerifiedAt,
@@ -103,19 +107,40 @@ func (r *Run) WorktreePath() string {
 
 // InsertRun creates a new run record.
 func (d *DB) InsertRun(repoID, branch, headSHA, baseSHA string) (*Run, error) {
-	return d.InsertRunWithIntent(repoID, branch, headSHA, baseSHA, nil)
+	return d.InsertRunWithOptions(repoID, branch, headSHA, baseSHA, RunOptions{})
 }
 
 func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent *RunIntent) (*Run, error) {
+	return d.InsertRunWithOptions(repoID, branch, headSHA, baseSHA, RunOptions{Intent: intent})
+}
+
+// RunOptions carries immutable values selected at run creation.
+type RunOptions struct {
+	Intent       *RunIntent
+	TargetBranch string
+}
+
+// InsertRunWithOptions creates a run and atomically persists its immutable
+// target when one is already known. TargetBranch may be empty only while the
+// daemon is still loading the trusted repository config needed to choose the
+// legacy pr.base_branch/default fallback; SetRunTargetBranch pins that choice
+// before pipeline execution begins.
+func (d *DB) InsertRunWithOptions(repoID, branch, headSHA, baseSHA string, opts RunOptions) (*Run, error) {
 	ts := now()
 	version := buildinfo.CurrentVersion()
 	buildSHA := buildinfo.Commit
+	var targetBranch *string
+	if strings.TrimSpace(opts.TargetBranch) != "" {
+		target := strings.TrimSpace(opts.TargetBranch)
+		targetBranch = &target
+	}
 	r := &Run{
 		ID:                 newID(),
 		RepoID:             repoID,
 		Branch:             branch,
 		HeadSHA:            headSHA,
 		BaseSHA:            baseSHA,
+		TargetBranch:       targetBranch,
 		SubmittedHeadSHA:   &headSHA,
 		NoMistakesVersion:  &version,
 		NoMistakesBuildSHA: &buildSHA,
@@ -123,20 +148,45 @@ func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent
 		CreatedAt:          ts,
 		UpdatedAt:          ts,
 	}
-	if intent != nil {
-		r.Intent = &intent.Summary
-		r.IntentSource = &intent.Source
-		r.IntentSessionID = &intent.SessionID
-		r.IntentScore = &intent.Score
+	if opts.Intent != nil {
+		r.Intent = &opts.Intent.Summary
+		r.IntentSource = &opts.Intent.Source
+		r.IntentSessionID = &opts.Intent.SessionID
+		r.IntentScore = &opts.Intent.Score
 	}
 	_, err := d.sql.Exec(
-		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, target_branch, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, r.TargetBranch, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
 	}
 	return r, nil
+}
+
+// SetRunTargetBranch pins a target selected after trusted config loading. An
+// explicitly supplied target is inserted with the run, so this update may only
+// fill an empty value or confirm that same value; it can never retarget a run.
+func (d *DB) SetRunTargetBranch(id, targetBranch string) error {
+	targetBranch = strings.TrimSpace(targetBranch)
+	if targetBranch == "" {
+		return fmt.Errorf("set run target branch: target branch is empty")
+	}
+	result, err := d.sql.Exec(
+		`UPDATE runs SET target_branch = ?, updated_at = ? WHERE id = ? AND (target_branch IS NULL OR target_branch = ?)`,
+		targetBranch, now(), id, targetBranch,
+	)
+	if err != nil {
+		return fmt.Errorf("set run target branch: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set run target branch: inspect update: %w", err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("set run target branch: run %s already has a different target", id)
+	}
+	return nil
 }
 
 // RunWorktree is one run's recorded worktree placement, identified by the run

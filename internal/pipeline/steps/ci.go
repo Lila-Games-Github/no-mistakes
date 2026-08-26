@@ -199,7 +199,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return nil, fmt.Errorf("extract PR number: %w", err)
 	}
 	pr := &scm.PR{Number: prNumber, URL: prURL}
-	baseBranch := effectivePRBaseBranch(sctx)
+	baseBranch := runTargetBranch(sctx)
 	// A resumed run may have a different trusted configuration than the run
 	// that created this PR. Re-read the forge record without a base filter so
 	// conflict repair and tip monitoring follow the PR's actual target.

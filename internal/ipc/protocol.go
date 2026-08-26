@@ -67,12 +67,15 @@ func (e *RPCError) Error() string { return e.Message }
 // intent from local transcripts.
 type PushReceivedParams struct {
 	// Gate is the absolute path to the gate bare repo.
-	Gate      string           `json:"gate"`
-	Ref       string           `json:"ref"`
-	Old       string           `json:"old"`
-	New       string           `json:"new"`
-	SkipSteps []types.StepName `json:"skip_steps,omitempty"`
-	Intent    string           `json:"intent,omitempty"`
+	Gate string `json:"gate"`
+	Ref  string `json:"ref"`
+	Old  string `json:"old"`
+	New  string `json:"new"`
+	// TargetBranch is an optional explicit integration branch supplied by the
+	// run initiator. The daemon validates and persists it before execution.
+	TargetBranch string           `json:"target_branch,omitempty"`
+	SkipSteps    []types.StepName `json:"skip_steps,omitempty"`
+	Intent       string           `json:"intent,omitempty"`
 }
 
 // GetRunParams requests a single run by ID.
@@ -128,6 +131,7 @@ type RerunParams struct {
 	RepoID        string           `json:"repo_id"`
 	Branch        string           `json:"branch"`
 	PreviousRunID string           `json:"previous_run_id,omitempty"`
+	TargetBranch  string           `json:"target_branch,omitempty"`
 	SkipSteps     []types.StepName `json:"skip_steps,omitempty"`
 	Intent        string           `json:"intent,omitempty"`
 }
@@ -250,6 +254,7 @@ type RunInfo struct {
 	HeadSHA          string          `json:"head_sha"`
 	SubmittedHeadSHA *string         `json:"submitted_head_sha,omitempty"`
 	BaseSHA          string          `json:"base_sha"`
+	TargetBranch     *string         `json:"target_branch,omitempty"`
 	Status           types.RunStatus `json:"status"`
 	PRURL            *string         `json:"pr_url,omitempty"`
 	Error            *string         `json:"error,omitempty"`
