@@ -117,6 +117,7 @@ Err on the side of completeness: include the goal, important decisions and trade
 Use it when the feature was forked from a non-default integration branch and this run must review only that delta.
 The daemon fetches and resolves the exact upstream branch, fails the run when it is missing or has no common history with the feature, and stores the selected branch durably before pipeline execution.
 That stored target is used consistently by intent matching, rebase, review, test, document, lint, and new PR creation; daemon restart, recovery, and rerun inherit it rather than re-reading mutable configuration.
+Use `no-mistakes axi status` to inspect the stored `target_branch` for a run.
 When omitted, [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) is selected when configured, otherwise the repository default branch is selected, preserving existing behavior.
 If a PR already exists, post-PR CI monitoring and conflict repair continue to trust the forge PR's actual base branch.
 When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
