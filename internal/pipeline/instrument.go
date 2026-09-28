@@ -12,6 +12,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -55,8 +56,18 @@ func (a *perfRecordingAgent) Run(ctx context.Context, opts agent.RunOpts) (*agen
 		attemptOpts.SessionFallback = attempt.SessionFallback
 		a.record(ctx, attemptOpts, attempt.Agent, attempt.Result, attempt.Err, attempt.StartedAt, attempt.CompletedAt)
 	}
+	contextBytes := len(opts.Prompt) + len(opts.JSONSchema)
+	runmetrics.ContextReady(ctx, contextBytes)
+	finishAgent := runmetrics.Start(ctx, runmetrics.Agent)
 	start := time.Now()
 	result, err := a.inner.Run(ctx, opts)
+	dispatchQueueMS := int64(0) // synchronous local dispatch has no queue; provider queues are unknown
+	input := runmetrics.Input{ContextBytes: &contextBytes, DispatchQueueMS: &dispatchQueueMS}
+	if opts.Workload != nil {
+		files, lines := opts.Workload.Files, opts.Workload.Lines
+		input.ChangedFiles, input.ChangedLines = &files, &lines
+	}
+	finishAgent(err, nil, input)
 	if attempts == 0 {
 		a.record(ctx, opts, a.inner.Name(), result, err, start, time.Now())
 	}

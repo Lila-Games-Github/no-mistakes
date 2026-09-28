@@ -10,6 +10,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -618,7 +619,10 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 				}
 			}
 		}
-		if err := waitForNextPoll(ctx, interval); err != nil {
+		finishWait := runmetrics.Start(ctx, runmetrics.CIPollWait)
+		waitErr := waitForNextPoll(ctx, interval)
+		finishWait(waitErr, nil, runmetrics.Input{})
+		if err := waitErr; err != nil {
 			return nil, err
 		}
 	}

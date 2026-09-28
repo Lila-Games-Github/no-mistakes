@@ -87,6 +87,10 @@ Safest local verification sequence after non-trivial changes:
 - One owner per fact: `docs/src/content/docs/reference/global-config.md` and `docs/src/content/docs/reference/repo-config.md` own configuration keys, `docs/src/content/docs/reference/environment.md` owns environment variables and the telemetry local/remote split, `docs/src/content/docs/concepts/daemon.md` owns the daemon lifecycle model, and guides pages explain purpose and link to those owners instead of restating tables and examples.
 - The `document.instructions` block in `.no-mistakes.yaml` states this ownership map for the pipeline's document step; update it when ownership moves.
 
+**Local Run Metrics (`internal/runmetrics`)**
+
+- Reuse `step_results.duration_ms`, step rounds, and agent invocation records; optional context-scoped spans add detail without changing a gate. `internal/runmetrics` owns the numeric-only journal and versioned artifact, and `docs/src/content/docs/reference/run-metrics.md` owns their schema and observation limits. Nested details overlap; never sum them into run wall time or treat missing measurements as zero.
+
 **Agent-Guidance Surfaces**
 
 - `skills/no-mistakes/SKILL.md` is **generated**: the source of truth is the `body` constant in `internal/skill/skill.go`. Edit the body, then `make skill`; `make lint` fails CI on drift. Never edit `SKILL.md` directly. `no-mistakes init` ships this rendering to agents at user level.

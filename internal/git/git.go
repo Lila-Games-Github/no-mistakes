@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
@@ -136,6 +137,24 @@ func runInDirWithEnv(ctx context.Context, dir string, extraEnv []string, args ..
 }
 
 func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	op := runmetrics.Operation("")
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--git-dir=") {
+			continue
+		}
+		switch arg {
+		case "worktree":
+			op = runmetrics.Worktree
+		case "fetch":
+			op = runmetrics.Fetch
+		case "rebase":
+			op = runmetrics.Rebase
+		case "diff":
+			op = runmetrics.Diff
+		}
+		break
+	}
+	finish := runmetrics.Start(ctx, op)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(nonInteractiveEnvForContext(ctx, dir), extraEnv...)
@@ -147,6 +166,7 @@ func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args
 	cmd.Stderr = &stderr
 	shellenv.ConfigureShellCommand(cmd)
 	out, err := shellenv.OutputShellCommand(cmd)
+	finish(err, nil, runmetrics.Input{})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			err = fmt.Errorf("%w (%v)", ctxErr, err)

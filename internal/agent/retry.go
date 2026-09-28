@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 )
 
 // retryClassifier inspects an error and reports whether it should be retried,
@@ -68,7 +70,10 @@ func runWithRetry(
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			emitAgentRetry(opts, name, lastLabel, attempt+1, maxRetries+1)
-			if err := transientBackoff(ctx, attempt); err != nil {
+			finishWait := runmetrics.Start(ctx, runmetrics.BackoffWait)
+			backoffErr := transientBackoff(ctx, attempt)
+			finishWait(backoffErr, nil, runmetrics.Input{})
+			if err := backoffErr; err != nil {
 				return nil, err
 			}
 		}

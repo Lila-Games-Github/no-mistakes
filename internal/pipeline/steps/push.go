@@ -8,6 +8,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -31,7 +32,9 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	// Run format command if configured (before committing, so changes are formatted)
 	if fmtCmd := sctx.Config.Commands.Format; fmtCmd != "" {
 		sctx.Log(fmt.Sprintf("running formatter: %s", fmtCmd))
+		finishFormat := runmetrics.Start(ctx, runmetrics.Formatting)
 		output, exitCode, err := runStepShellCommand(sctx, fmtCmd)
+		finishFormat(err, &exitCode, runmetrics.Input{})
 		if err != nil {
 			sctx.Log(fmt.Sprintf("warning: format command failed: %v", err))
 		} else if exitCode != 0 {
