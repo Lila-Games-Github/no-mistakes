@@ -26,6 +26,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
 	"github.com/kunchenguid/no-mistakes/internal/runenv"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -950,6 +951,15 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
+	ctx, metricsRecorder := runmetrics.Attach(ctx, m.paths.RunLogDir(run.ID))
+	finishPreparation := runmetrics.Start(ctx, runmetrics.Preparation)
+	metricsTransferred := false
+	defer func() {
+		if !metricsTransferred {
+			finishPreparation(fmt.Errorf("setup failed"), nil, runmetrics.Input{})
+			runmetrics.Finish(metricsRecorder, m.db, run.ID, m.paths.RunLogDir(run.ID))
+		}
+	}()
 
 	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
 	if err != nil {
@@ -1191,6 +1201,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 
 	// Create executor with event broadcast.
 	runCtx, cancel := context.WithCancelCause(context.Background())
+	runCtx, _ = runmetrics.AttachTo(runCtx, ctx)
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
 	executor.SetForgeContext(forgeCtx)
 	executor.SetSkippedSteps(skipSteps)
@@ -1212,6 +1223,8 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 
 	// Background goroutine now owns worktree cleanup.
 	bgOwnsWorktree = true
+	finishPreparation(nil, nil, runmetrics.Input{})
+	metricsTransferred = true
 
 	// Launch pipeline in background.
 	m.wg.Add(1)
@@ -1250,6 +1263,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 				if dbErr != nil {
 					slog.Error("failed to update run after panic", "run_id", run.ID, "error", dbErr)
 				}
+				_ = runmetrics.Publish(m.db, run.ID, m.paths.RunLogDir(run.ID))
 			}
 			cancel(nil)
 			ag.Close()

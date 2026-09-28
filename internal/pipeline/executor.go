@@ -22,6 +22,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -181,6 +182,8 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 // If the context is cancelled with a cause (via context.WithCancelCause),
 // the cause message is preserved as the run's error in the DB.
 func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
+	ctx, metricsRecorder := runmetrics.Attach(ctx, e.paths.RunLogDir(run.ID))
+	defer runmetrics.Finish(metricsRecorder, e.db, run.ID, e.paths.RunLogDir(run.ID))
 	e.workDir = workDir
 	ctx = e.runContext(ctx)
 	// Mark run as running. Route write failures through failRun so the
@@ -335,6 +338,8 @@ func ValidateRecoveredRun(database *db.DB, run *db.Run, steps []Step) error {
 // daemon stopped. It only accepts a fully recorded gate and otherwise returns
 // an error so startup recovery can fail the run rather than guessing.
 func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
+	ctx, metricsRecorder := runmetrics.Attach(ctx, e.paths.RunLogDir(run.ID))
+	defer runmetrics.Finish(metricsRecorder, e.db, run.ID, e.paths.RunLogDir(run.ID))
 	e.workDir = workDir
 	ctx = e.runContext(ctx)
 	if repo == nil {
@@ -681,6 +686,7 @@ func recoveredLogPath(step *db.StepResult) string {
 // and any execution error.
 func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult, run *db.Run, repo *db.Repo, workDir, logDir string, state stepExecutionState) (bool, types.StepName, error) {
 	stepName := step.Name()
+	ctx = runmetrics.Scope(ctx, string(stepName), 0)
 	logPath := filepath.Join(logDir, string(stepName)+".log")
 	finalExitCode := 0
 	autoFixLimit := 0
@@ -858,7 +864,15 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	for {
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
+		sctx.Ctx = runmetrics.BeginContext(runmetrics.Scope(sctx.Ctx, string(stepName), roundNum+1))
+		finishCycle := runmetrics.Start(sctx.Ctx, runmetrics.Cycle)
 		outcome, err := step.Execute(sctx)
+		var cycleExit *int
+		if outcome != nil {
+			code := outcome.ExitCode
+			cycleExit = &code
+		}
+		finishCycle(err, cycleExit, runmetrics.Input{})
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
 		if err != nil {
@@ -1285,7 +1299,13 @@ func pluralize(n int, singular, plural string) string {
 // cancelled. Reconciliation runs synchronously under a bounded child context,
 // so no watcher goroutine can outlive approval, cancellation, or shutdown.
 // The caller must set e.waiting and e.waitingStep before calling this method.
-func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sctx *StepContext, immediate bool) (approvalResponse, bool, error) {
+func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sctx *StepContext, immediate bool) (response approvalResponse, reconciled bool, err error) {
+	metricsCtx := ctx
+	if sctx != nil && sctx.Ctx != nil {
+		metricsCtx = sctx.Ctx
+	}
+	finishGate := runmetrics.Start(runmetrics.Scope(metricsCtx, string(step.Name()), 0), runmetrics.HumanGate)
+	defer func() { finishGate(err, nil, runmetrics.Input{}) }()
 	defer func() {
 		e.mu.Lock()
 		e.waiting = false

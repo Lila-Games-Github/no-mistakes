@@ -38,6 +38,7 @@ export default defineConfig({
           items: [
             { label: "Configuration", slug: "guides/configuration" },
             { label: "Choosing an Agent", slug: "guides/agents" },
+            { label: "Collecting a Timing Baseline", slug: "guides/run-metrics-baseline" },
             { label: "Provider Integration", slug: "guides/provider-integration" },
             { label: "Setup Wizard", slug: "guides/setup-wizard" },
             { label: "Using the TUI", slug: "guides/tui" },
@@ -49,6 +50,7 @@ export default defineConfig({
           items: [
             { label: "CLI Commands", slug: "reference/cli" },
             { label: "Evaluation toolkit", slug: "reference/eval" },
+            { label: "Run Metrics", slug: "reference/run-metrics" },
             { label: "Pipeline Steps", slug: "reference/pipeline-steps" },
             { label: "Global Config", slug: "reference/global-config" },
             { label: "Repo Config", slug: "reference/repo-config" },

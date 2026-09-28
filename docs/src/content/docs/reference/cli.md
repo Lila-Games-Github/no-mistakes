@@ -425,6 +425,15 @@ no-mistakes stats --run <id>
 This detailed performance evidence stays local in `state.sqlite`; it is not sent to telemetry.
 The field definitions and their local/remote split are owned by [the environment reference](/reference/environment/#what-stays-local-and-what-leaves-the-machine).
 
+## no-mistakes metrics
+
+Export a run's local phase timing, repeated work, and review-value evidence. The command reads existing state without driving the daemon. Use `--json` for the versioned machine-readable artifact; omit it for a concise summary. See [Run Metrics](/reference/run-metrics/) for the schema and timing boundaries.
+
+```sh
+no-mistakes metrics <run-id>
+no-mistakes metrics <run-id> --json
+```
+
 ## no-mistakes doctor
 
 Check system health and dependencies.

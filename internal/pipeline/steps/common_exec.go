@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
@@ -285,6 +287,7 @@ func runShellCommandWithEnv(ctx context.Context, dir string, env []string, cmdSt
 }
 
 func runShellCommandWithProcessEnv(ctx context.Context, dir string, env []string, cmdStr string) (string, int, error) {
+	finish := runmetrics.Start(ctx, runmetrics.Command)
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", cmdStr)
@@ -297,6 +300,15 @@ func runShellCommandWithProcessEnv(ctx context.Context, dir string, env []string
 		cmd.Env = env
 	}
 	out, err := shellenv.CombinedOutputShellCommand(cmd)
+	code := 0
+	if err != nil {
+		code = -1
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		}
+	}
+	finish(err, &code, runmetrics.Input{})
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return string(out), ee.ExitCode(), nil
