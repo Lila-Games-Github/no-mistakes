@@ -28,12 +28,17 @@ func runGateAndRespond(t *testing.T, action types.ApprovalAction, findings strin
 		},
 	}
 	exec := NewExecutor(database, p, nil, nil, []Step{step, newPassStep(types.StepTest)}, nil)
+	if action == types.ActionSkip {
+		exec.SetSkippedSteps([]types.StepName{types.StepPush})
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- exec.Execute(context.Background(), run, repo, workDir) }()
 
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
-	exec.Respond(types.StepReview, action, nil)
+	if err := exec.Respond(types.StepReview, action, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-done:

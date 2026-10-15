@@ -479,16 +479,23 @@ func gateFields(gate stepView) []toon.Field {
 	}
 	gfields = append(gfields, toon.Field{Key: "findings", Value: rows})
 
+	help := []string{
+		"Run `no-mistakes axi respond --action approve` to accept this step and continue",
+		"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
+	}
+	if gate.Name == string(types.StepReview) {
+		help = append(help, "Review skip is refused when Push is enabled: Push requires a durably recorded review-approved head. Approve or fix Review, or start a new run with Push skipped.")
+	} else {
+		help = append(help, "Run `no-mistakes axi respond --action skip` to skip this step")
+	}
+	help = append(help,
+		fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to read the full step log", gate.Name),
+		"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
+		preserveGateFixCommitsGuidance,
+	)
 	return []toon.Field{
 		{Key: "gate", Value: toon.NewObject(gfields...)},
-		{Key: "help", Value: []string{
-			"Run `no-mistakes axi respond --action approve` to accept this step and continue",
-			"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
-			"Run `no-mistakes axi respond --action skip` to skip this step",
-			fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to read the full step log", gate.Name),
-			"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
-			preserveGateFixCommitsGuidance,
-		}},
+		{Key: "help", Value: help},
 	}
 }
 

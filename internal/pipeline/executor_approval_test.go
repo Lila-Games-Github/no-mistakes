@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,63 @@ func TestExecutor_ApprovalFix(t *testing.T) {
 	// Step should have been called twice (initial + after fix)
 	if callCount != 2 {
 		t.Errorf("expected step to be called 2 times, got %d", callCount)
+	}
+}
+
+func TestExecutor_ReviewSkipRequiresPushSkipped(t *testing.T) {
+	for _, pushSkipped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("push_skipped_%t", pushSkipped), func(t *testing.T) {
+			database, p, run, repo := setupTest(t)
+			review := &mockStep{name: types.StepReview, outcome: &StepOutcome{NeedsApproval: true}}
+			push := newPassStep(types.StepPush)
+			exec := NewExecutor(database, p, nil, nil, []Step{review, push}, nil)
+			workDir := t.TempDir()
+			if pushSkipped {
+				exec.SetSkippedSteps([]types.StepName{types.StepPush})
+			}
+			done := make(chan error, 1)
+			go func() { done <- exec.Execute(context.Background(), run, repo, workDir) }()
+			waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+
+			err := exec.Respond(types.StepReview, types.ActionSkip, nil)
+			if pushSkipped {
+				if err != nil {
+					t.Fatalf("skip with push skipped: %v", err)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), "push requires a durably recorded review-approved head") {
+					t.Fatalf("skip with push enabled error = %v", err)
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("run advanced after refused skip: %v", err)
+				default:
+				}
+				waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+				if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+					t.Fatalf("approve after refused skip: %v", err)
+				}
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("executor timed out")
+			}
+			steps, err := database.GetStepsByRun(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReview, wantPush := types.StepStatusCompleted, types.StepStatusCompleted
+			if pushSkipped {
+				wantReview, wantPush = types.StepStatusSkipped, types.StepStatusSkipped
+			}
+			if steps[0].Status != wantReview || steps[1].Status != wantPush {
+				t.Fatalf("step statuses = %s, %s; want %s, %s", steps[0].Status, steps[1].Status, wantReview, wantPush)
+			}
+		})
 	}
 }
 

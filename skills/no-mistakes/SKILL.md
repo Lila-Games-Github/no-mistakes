@@ -195,9 +195,12 @@ Run the pipeline and decide on its findings as they come up:
    # have the pipeline fix specific findings, then continue
    no-mistakes axi respond --action fix --findings <id1,id2> --instructions "<optional guidance>"
 
-   # skip this step
+   # skip this step (Review skip requires Push to be skipped in the same run)
    no-mistakes axi respond --action skip
    ```
+   At a Review gate, skip is refused while Push is enabled because Push needs
+   a durably recorded review-approved head. Approve or fix Review, or start a
+   new run with Push also skipped.
    While a run is active, never fix findings by editing the code yourself -
    the pipeline owns both the findings and the fixes. Your job at a gate is to
    decide and respond; `--action fix` has the pipeline apply the fix and
@@ -340,7 +343,7 @@ findings[2]{id,severity,file,line,action,description}:
 help[6]:
   Run `no-mistakes axi respond --action approve` to accept this step and continue
   Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)
-  Run `no-mistakes axi respond --action skip` to skip this step
+  Review skip is refused when Push is enabled: Push requires a durably recorded review-approved head. Approve or fix Review, or start a new run with Push skipped.
   Run `no-mistakes axi logs --step review --full` to read the full step log
   A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.
   Commit post-pipeline follow-up work on top of the existing branch so every pipeline fix commit remains present. Never abort-and-restart, reset, or replace the branch in a way that drops prior gate-fix commits.

@@ -102,6 +102,7 @@ AI code review of your diff.
 - With the default `session_reuse: true`, Claude, Codex, Grok, Pi, and Antigravity reuse one durable fixer session across review-fix turns; a resume failure retries the same fix turn in a fresh fixer session, and unsupported agents run cold
 - Bounds its agent turns with [`review_agent_timeout`](/no-mistakes/reference/global-config/#review_agent_timeout): a round's optional fix turn and its rereview turn share one budget, each later auto-fix round starts a fresh one, and an expired budget cancels the agent and fails the step with a timeout diagnostic rather than leaving the run active indefinitely
 - Atomically records the exact commit examined when a full review completes successfully; a parked review retains its candidate only for recovery, while failed, skipped, superseded, and legacy reviews grant no inferred approval authority
+- Refuses a Review gate `skip` response while Push is enabled, leaving the gate open so you can approve or fix Review. To skip Review, start a new run with Push also skipped; a skipped Review cannot supply the approved-head binding Push requires. This applies to recovered gates too.
 
 **Approval:** required if any finding has severity `error` or `warning`. Findings with `action: ask-user` pause for approval instead of entering the normal auto-fix loop. This is for findings that challenge the author's intent, not routine correctness, reliability, or security fixes that may need to re-add a small amount of deleted logic. With the default `auto_fix.review: 0`, blocking review findings park for approval even when their action is `auto-fix`; setting repo or global `auto_fix.review` above `0` re-enables the automatic review fix loop for eligible `auto-fix` findings. Findings with `action: no-op` are informational only. The shared [finding-action model](/no-mistakes/concepts/auto-fix/#finding-actions) owns the behavior for a missing `action`.
 
@@ -203,7 +204,7 @@ Pushes the validated branch to the configured push target.
 
 A remote branch can move without being rejected when all remote commits are already represented in the validated head, or when a run is intentionally rewriting history it already knew about.
 Any other out-of-band commit stops the push instead of being overwritten.
-Pre-skipping or later skipping Review leaves no approval binding, so Push fails closed unless Push is also skipped.
+Pre-skipping Review leaves no approval binding, so Push fails closed unless Push is also skipped. At an active Review gate, a skip response is refused immediately when Push is enabled.
 
 This step never requires approval - it runs automatically after review, test, document, and lint pass.
 
