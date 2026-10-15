@@ -299,11 +299,16 @@ func TestWriteGateShape(t *testing.T) {
 		// reminder so an agent reads them at the point of use.
 		"Review auto-fix is disabled by default",
 		"auto_fix.review > 0",
+		"Review skip is refused when Push is enabled",
+		"Push requires a durably recorded review-approved head",
 		"the run never advances past a gate on its own",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("gate missing %q in:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "Run `no-mistakes axi respond --action skip` to skip this step") {
+		t.Fatalf("review gate advertises an incompatible skip action:\n%s", out)
 	}
 }
 

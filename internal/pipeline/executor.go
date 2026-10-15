@@ -61,10 +61,12 @@ type Executor struct {
 	shared   *RunShared
 	workDir  string
 
-	mu          sync.Mutex
-	approvalCh  chan approvalResponse // buffered channel for approval responses
-	waiting     bool                  // true when blocked on approval
-	waitingStep types.StepName        // which step is currently awaiting approval
+	mu           sync.Mutex
+	approvalCh   chan approvalResponse // buffered channel for approval responses
+	waiting      bool                  // true when blocked on approval
+	waitingStep  types.StepName        // which step is currently awaiting approval
+	waitingRunID string                // run whose gate is awaiting approval
+	recovering   bool                  // recovered remainder honors stored skipped steps
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -165,7 +167,29 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		e.mu.Unlock()
 		return fmt.Errorf("step mismatch: responding to %q but %q is awaiting approval", step, e.waitingStep)
 	}
+	if step == types.StepReview && action == types.ActionSkip && !e.skips[types.StepPush] {
+		// Recovery has no in-memory skip list. A Push step already marked
+		// skipped is still safe; a pending Push step will execute after this gate.
+		pushSkipped := false
+		if e.recovering {
+			steps, err := e.db.GetStepsByRun(e.waitingRunID)
+			if err != nil {
+				e.mu.Unlock()
+				return fmt.Errorf("check push status before skipping review: %w", err)
+			}
+			for _, result := range steps {
+				if result.StepName == types.StepPush && result.Status == types.StepStatusSkipped {
+					pushSkipped = true
+				}
+			}
+		}
+		if !pushSkipped {
+			e.mu.Unlock()
+			return fmt.Errorf("cannot skip review while push is enabled: push requires a durably recorded review-approved head; approve or fix review, or start a new run with push skipped")
+		}
+	}
 	e.waiting = false
+	e.waitingRunID = ""
 	e.mu.Unlock()
 
 	e.approvalCh <- approvalResponse{
@@ -338,6 +362,7 @@ func ValidateRecoveredRun(database *db.DB, run *db.Run, steps []Step) error {
 // daemon stopped. It only accepts a fully recorded gate and otherwise returns
 // an error so startup recovery can fail the run rather than guessing.
 func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
+	e.recovering = true
 	ctx, metricsRecorder := runmetrics.Attach(ctx, e.paths.RunLogDir(run.ID))
 	defer runmetrics.Finish(metricsRecorder, e.db, run.ID, e.paths.RunLogDir(run.ID))
 	e.workDir = workDir
@@ -422,6 +447,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.mu.Lock()
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
+	e.waitingRunID = run.ID
 	e.mu.Unlock()
 	e.emitStepEventWithFindingsAndError(
 		ipc.EventStepCompleted,
@@ -1010,6 +1036,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		e.mu.Lock()
 		e.waiting = true
 		e.waitingStep = stepName
+		e.waitingRunID = run.ID
 		e.mu.Unlock()
 
 		// Parking starts before the gate becomes observable. This includes the
