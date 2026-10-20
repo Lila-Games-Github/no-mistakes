@@ -227,8 +227,8 @@ type RepoConfig struct {
 	// EffectiveRepoConfig): a contributor's pushed branch must not be able to
 	// weaken documentation rules for its own review.
 	Document DocumentRaw `yaml:"document"`
-	// Review carries the repository's review-step settings. Its
-	// path_instructions steer the review gate prompt, so they are honored
+	// Review carries the repository's review-step settings. Its prompt rules
+	// and chunk threshold steer the review gate, so they are honored
 	// ONLY from the trusted default-branch copy of .no-mistakes.yaml (see
 	// EffectiveRepoConfig), regardless of allow_repo_commands: a contributor's
 	// pushed branch must not be able to inject or weaken the guidance that
@@ -273,6 +273,10 @@ type ReviewRaw struct {
 	// at least one changed file; a run that touches nothing matching leaves
 	// the review prompt exactly as it is without this setting.
 	PathInstructions []PathInstruction `yaml:"path_instructions"`
+	// ChunkThresholdLines enables independent bounded review turns only when
+	// the full change exceeds this many added plus deleted lines. Zero keeps
+	// the existing single-turn review, pending finding-recall evidence.
+	ChunkThresholdLines int `yaml:"chunk_threshold_lines"`
 }
 
 // PRRaw is the YAML representation of pull-request settings.
@@ -533,11 +537,12 @@ type Document struct {
 	Instructions string
 }
 
-// Review is the resolved review-step config. PathInstructions come from the
-// trusted default-branch repo config and scope extra review guidance to the
-// changed paths each glob matches.
+// Review is the resolved review-step config. Both fields come from the trusted
+// default-branch repo config. PathInstructions scope extra guidance to changed
+// paths; ChunkThresholdLines opts in to bounded turns for large diffs.
 type Review struct {
-	PathInstructions []PathInstruction
+	PathInstructions    []PathInstruction
+	ChunkThresholdLines int
 }
 
 // TestRaw is the YAML representation of test-step settings.
@@ -2017,6 +2022,9 @@ func validatePRRaw(pr PRRaw) error {
 // invalid block has to fail here, before it merges, rather than brick the
 // repository's pipeline afterwards. Do not scope this to the trusted copy.
 func validateReviewRaw(review ReviewRaw) error {
+	if review.ChunkThresholdLines < 0 || (review.ChunkThresholdLines > 0 && review.ChunkThresholdLines <= 500) {
+		return fmt.Errorf("review.chunk_threshold_lines must be 0 (disabled) or greater than 500")
+	}
 	if len(review.PathInstructions) > MaxReviewPathInstructions {
 		return fmt.Errorf("review.path_instructions has %d entries, at most %d are allowed", len(review.PathInstructions), MaxReviewPathInstructions)
 	}
@@ -2071,8 +2079,8 @@ func validatePathInstructionGlob(pattern string) error {
 // pushed branch cannot inject shell or pick an agent. Document (the
 // documentation placement policy injected into the document gate prompt) is
 // trusted-only for the same reason: a pushed branch must not weaken the
-// documentation rules that gate itself. Review (the path-scoped guidance
-// injected into the review gate prompt) is trusted-only for the same reason: a
+// documentation rules that gate itself. Review (path-scoped guidance and the
+// large-diff chunk threshold) is trusted-only for the same reason: a
 // pushed branch must not steer the reviewer that gates it. DisableProjectSettings
 // is also trusted-only so a pushed branch cannot enable or defeat the gate-agent
 // project-instruction boundary. NoCI is trusted-only so a pushed branch cannot
@@ -2104,12 +2112,12 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 	effective := *pushed
 	if trusted != nil {
 		effective.Document = trusted.Document
-		// review.path_instructions steers the gate agent that reviews the pushed
-		// branch, so it is trusted-only exactly like document.instructions and
+		// Review settings steer the gate agent that reviews the pushed branch,
+		// so they are trusted-only exactly like document.instructions and
 		// regardless of allow_repo_commands: a contributor must not be able to
-		// inject rules into their own review, and enabling the commands opt-in
-		// must not silently drop the maintainer's review rules when the pushed
-		// branch happens to carry no review block.
+		// inject rules or change the threshold for their own review, and enabling
+		// the commands opt-in must not silently drop maintainer review settings
+		// when the pushed branch happens to carry no review block.
 		effective.Review = trusted.Review
 		// disable_project_settings is a security boundary: honor it ONLY from the
 		// trusted default-branch copy so a pushed branch cannot turn the opt-out
@@ -2507,7 +2515,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Intent:         intent,
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
-		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions)},
+		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines},
 		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
 		ForgeProfiles:  global.ForgeProfiles,
 		// repo is the EffectiveRepoConfig result, so this value is already

@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `review.chunk_threshold_lines`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -41,6 +41,8 @@ document:
 # Optional extra review guidance, scoped to the paths a change touches.
 # Read only from the trusted default branch.
 review:
+  # Experimental opt-in for very large changes; 0 (the default) disables it.
+  # chunk_threshold_lines: 5000
   path_instructions:
     - path: "internal/scm/**"
       instructions: |
@@ -312,6 +314,14 @@ These checks run on whichever copy of the file is parsed, including the pushed b
 
 Like `document.instructions`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): a value present only on a pushed branch is ignored, so a contributor cannot inject instructions into the review that gates them.
 
+### review.chunk_threshold_lines
+
+Opt in to bounded, independent review turns when a diff has more than this many added plus deleted lines. The default is `0` (disabled); a positive value must exceed `500`, so tiny, small, and medium changes retain the existing single-turn review. This setting is read only from the trusted default-branch config.
+
+The complete zero-context Git patch is partitioned in stable path order, with each turn receiving at most 128 KiB of patch text for diffs up to 1 MiB, or 256 KiB for broader diffs, and at most 96 paths. A file larger than a chunk continues in later turns with explicit byte offsets. In this opt-in mode, every changed path is assigned, including paths matching `ignore_patterns`. Each turn starts a fresh agent session, can inspect the full exact Git diff and related call sites, and returns structured findings. The step combines every turn's findings and highest risk; a missing or malformed turn fails the review. The whole review round still uses `review_agent_timeout`, so a large number of chunks may require a larger round budget.
+
+Use `no-mistakes eval run --case <id> --review-chunk-threshold-lines 0` and then the same command with a threshold above `500` to compare a captured case before enabling this setting. The replay override applies only in its isolated sandbox; it does not change the repository's gate config.
+
 ### Command process lifetime
 
 All configured `commands.*` entries are scoped to their step.
@@ -321,6 +331,8 @@ Do not rely on a configured command to leave a background server or watcher runn
 ### ignore_patterns
 
 Paths to exclude from review and documentation checks.
+
+When `review.chunk_threshold_lines` activates chunked review, its complete-diff coverage includes these paths in Review. The standard single-turn Review and the documentation step retain the exclusions.
 
 | | |
 | --- | --- |

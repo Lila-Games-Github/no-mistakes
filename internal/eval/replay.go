@@ -34,8 +34,15 @@ type ReplayOptions struct {
 	Set       string
 	Candidate Candidate
 	Repeats   int
-	OnPlan    func(session Session, cases []Case)
-	OnResult  func(evaluation Evaluation, completed, total int)
+	// CaseIDs narrows the selected set to exact captured cases for paired
+	// experiments. Both variants then retain the same cohort identity.
+	CaseIDs []string
+	// ReviewChunkThresholdLines overrides the captured review setting only in
+	// this isolated replay. Nil preserves the captured configuration. Zero is
+	// the unchunked control; positive values must keep medium changes intact.
+	ReviewChunkThresholdLines *int
+	OnPlan                    func(session Session, cases []Case)
+	OnResult                  func(evaluation Evaluation, completed, total int)
 }
 
 // Session records the immutable local plan used for one replay batch.
@@ -68,6 +75,9 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	if err := opts.Candidate.Validate(); err != nil {
 		return Session{}, nil, err
 	}
+	if opts.ReviewChunkThresholdLines != nil && *opts.ReviewChunkThresholdLines != 0 && *opts.ReviewChunkThresholdLines <= 500 {
+		return Session{}, nil, fmt.Errorf("review chunk threshold must be 0 or greater than 500")
+	}
 	cases, session, err := store.prepareReplay(ctx, opts)
 	if err != nil {
 		return Session{}, nil, err
@@ -88,7 +98,7 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	var failed int
 	for repeat := 1; repeat <= opts.Repeats; repeat++ {
 		for _, c := range cases {
-			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, repeat)
+			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, opts.ReviewChunkThresholdLines, repeat)
 			if evaluation.Status != "completed" {
 				failed++
 			}
@@ -118,10 +128,31 @@ func (s *Store) prepareReplay(ctx context.Context, opts ReplayOptions) ([]Case, 
 	if err != nil {
 		return nil, Session{}, err
 	}
+	if len(opts.CaseIDs) > 0 {
+		wanted := make(map[string]bool, len(opts.CaseIDs))
+		for _, id := range opts.CaseIDs {
+			wanted[id] = true
+		}
+		filtered := cases[:0]
+		for _, c := range cases {
+			if wanted[c.ID] {
+				filtered = append(filtered, c)
+				delete(wanted, c.ID)
+			}
+		}
+		if len(wanted) > 0 {
+			return nil, Session{}, fmt.Errorf("requested eval case is absent from set %q", opts.Set)
+		}
+		cases = filtered
+	}
 	if len(cases) == 0 {
 		return nil, Session{}, fmt.Errorf("case set %q is empty", opts.Set)
 	}
-	session := Session{ID: newSessionID(), StartedAt: time.Now().UTC(), Set: opts.Set, Candidate: opts.Candidate.String(), Repeats: opts.Repeats}
+	candidateName := opts.Candidate.String()
+	if opts.ReviewChunkThresholdLines != nil {
+		candidateName = fmt.Sprintf("%s,review_chunk_threshold_lines=%d", candidateName, *opts.ReviewChunkThresholdLines)
+	}
+	session := Session{ID: newSessionID(), StartedAt: time.Now().UTC(), Set: opts.Set, Candidate: candidateName, Repeats: opts.Repeats}
 	for _, c := range cases {
 		session.CaseIDs = append(session.CaseIDs, c.ID)
 	}
@@ -185,13 +216,13 @@ func (s *Store) releaseReplayReservation(sessionID string) {
 	_, _ = s.db.Exec(`DELETE FROM replay_case_reservations WHERE session_id = ?`, sessionID)
 }
 
-func replayOne(ctx context.Context, store *Store, c Case, session Session, candidate Candidate, repeat int) (evaluation Evaluation) {
+func replayOne(ctx context.Context, store *Store, c Case, session Session, candidate Candidate, chunkThreshold *int, repeat int) (evaluation Evaluation) {
 	started := time.Now()
 	evaluation = Evaluation{
 		ID:        newSessionID(),
 		SessionID: session.ID,
 		CaseID:    c.ID,
-		Candidate: candidate.String(),
+		Candidate: session.Candidate,
 		Cohort:    session.Cohort,
 		Repeat:    repeat,
 		StartedAt: started.Unix(),
@@ -254,6 +285,9 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		evaluation.Error = safeurl.RedactText(err.Error())
 		evaluation.CompletedAt = time.Now().Unix()
 		return evaluation
+	}
+	if chunkThreshold != nil {
+		cfg.Review.ChunkThresholdLines = *chunkThreshold
 	}
 	cfg.Agent = candidate.Agent
 	cfg.Agents = []types.AgentName{candidate.Agent}
@@ -331,19 +365,23 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 	}
 	evaluation.CompletedAt = time.Now().Unix()
 	if observed.result != nil {
-		evaluation.Model = observed.result.Model
+		if observed.modelMismatch {
+			evaluation.Error = "candidate served different models across review chunks"
+			return evaluation
+		}
+		evaluation.Model = observed.model
 		if evaluation.Model == "" {
 			evaluation.Model = candidate.Model
 		} else if evaluation.Model != candidate.Model {
 			evaluation.Error = safeurl.RedactText(fmt.Sprintf("candidate served model %q, requested %q", evaluation.Model, candidate.Model))
 			return evaluation
 		}
-		if observed.result.UsageReported {
+		if !observed.usageMissing {
 			evaluation.TokensReported = true
-			evaluation.InputTokens = int64(observed.result.Usage.InputTokens)
-			evaluation.OutputTokens = int64(observed.result.Usage.OutputTokens)
-			evaluation.CacheReadTokens = int64(observed.result.Usage.CacheReadTokens)
-			evaluation.FreshInputTokens = int64(agent.FreshInputTokens(observed.result.Usage.InputTokens, observed.result.Usage.CacheReadTokens))
+			evaluation.InputTokens = int64(observed.usage.InputTokens)
+			evaluation.OutputTokens = int64(observed.usage.OutputTokens)
+			evaluation.CacheReadTokens = int64(observed.usage.CacheReadTokens)
+			evaluation.FreshInputTokens = int64(agent.FreshInputTokens(observed.usage.InputTokens, observed.usage.CacheReadTokens))
 		}
 	}
 	if err != nil {
@@ -480,12 +518,16 @@ func replayConfig(c Case) (*config.Config, error) {
 }
 
 type observedAgent struct {
-	inner        agent.Agent
-	ownership    *e2edaemon.Ownership
-	result       *agent.Result
-	durationMS   int64
-	ownershipErr error
-	mu           sync.Mutex
+	inner         agent.Agent
+	ownership     *e2edaemon.Ownership
+	result        *agent.Result
+	durationMS    int64
+	usage         agent.TokenUsage
+	usageMissing  bool
+	model         string
+	modelMismatch bool
+	ownershipErr  error
+	mu            sync.Mutex
 }
 
 func (a *observedAgent) Name() string { return a.inner.Name() }
@@ -510,6 +552,21 @@ func (a *observedAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Res
 	result, err := a.inner.Run(ctx, opts)
 	a.durationMS += time.Since(started).Milliseconds()
 	a.result = result
+	if result == nil || !result.UsageReported {
+		a.usageMissing = true
+	} else {
+		a.usage.InputTokens += result.Usage.InputTokens
+		a.usage.OutputTokens += result.Usage.OutputTokens
+		a.usage.CacheReadTokens += result.Usage.CacheReadTokens
+	}
+	if result != nil && result.Model != "" {
+		if a.model != "" && a.model != result.Model {
+			a.modelMismatch = true
+		}
+		if a.model == "" {
+			a.model = result.Model
+		}
+	}
 	a.mu.Lock()
 	ownershipErr := a.ownershipErr
 	a.mu.Unlock()

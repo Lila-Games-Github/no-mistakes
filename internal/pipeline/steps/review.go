@@ -143,22 +143,34 @@ Previous review findings to address:
 	reviewTargetSHA := sctx.Run.HeadSHA
 
 	// The changed-file set is read once and viewed two ways on purpose: the
-	// ignore-filtered subset decides whether there is anything to review, while
-	// trusted path instructions are selected against the complete set (see
-	// matchPathInstructions).
+	// ignore-filtered subset keeps the legacy small-review skip, while trusted
+	// path instructions and an enabled large-diff review use the complete set.
 	var args []string
 	if sctx.Fixing {
 		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA}
 	} else {
 		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA + ".." + sctx.Run.HeadSHA}
 	}
-	changedFiles, err := git.Run(ctx, sctx.WorkDir, args...)
+	changedFilesRaw, err := git.RunRaw(ctx, sctx.WorkDir, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get changed files: %w", err)
 	}
-	changed := changedPathList(changedFiles)
+	changed := changedPathList(string(changedFilesRaw))
+	diffRange := baseSHA + ".." + sctx.Run.HeadSHA
+	if sctx.Fixing {
+		diffRange = baseSHA
+	}
+	var patch string
+	var chunked bool
+	if len(changed) > 0 && sctx.Config.Review.ChunkThresholdLines > 0 {
+		patch, err = reviewPatch(ctx, sctx.WorkDir, diffRange)
+		if err != nil {
+			return nil, fmt.Errorf("build chunked review patch: %w", err)
+		}
+		chunked = changedLinesInPatch(patch) > sctx.Config.Review.ChunkThresholdLines
+	}
 
-	if len(reviewablePaths(changed, sctx.Config.IgnorePatterns)) == 0 {
+	if len(reviewablePaths(changed, sctx.Config.IgnorePatterns)) == 0 && !chunked {
 		sctx.Log("no changes to review")
 		noChangeFindings := Findings{
 			RiskLevel:     "low",
@@ -206,7 +218,7 @@ Previous review findings to address:
 	logPathInstructions(sctx.Log, pathInstructionMatches)
 	pathInstructions := reviewPathInstructionsSection(pathInstructionMatches)
 
-	prompt := fmt.Sprintf(
+	basePrompt := fmt.Sprintf(
 		`Review the code changes and return structured findings with a risk assessment.
 
 Context:
@@ -262,8 +274,9 @@ Risk assessment (after listing all findings):
 		targetBranch,
 		ignorePatterns,
 		historySection,
-		pathInstructions,
+		"",
 	)
+	prompt := basePrompt + pathInstructions
 
 	// Every review turn - the initial review and every post-fix rereview -
 	// deliberately runs session-free. Round N's fixes implement round N-1's
@@ -276,25 +289,33 @@ Risk assessment (after listing all findings):
 	// cross-round context a rereview legitimately needs travels in the
 	// explicit sanitized round-history section above; only the fixer keeps a
 	// durable session (executeFixMode), because it certifies nothing.
-	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		Env:        sctx.Env,
-		JSONSchema: reviewFindingsSchema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    "review",
-		Workload:   workload,
-	})
-	if err != nil {
-		return nil, reviewAgentError(ctx, timeout, "agent review", err)
-	}
-
-	// Parse structured findings
 	var findings Findings
-	if result.Output != nil {
-		if err := json.Unmarshal(result.Output, &findings); err != nil {
-			sctx.Log("could not parse structured output, using text response")
-			findings = Findings{Summary: result.Text}
+	if chunked {
+		findings, err = runChunkedReview(ctx, sctx, basePrompt, diffRange, changed, patch)
+		if err != nil {
+			return nil, reviewAgentError(ctx, timeout, "agent review", err)
+		}
+	}
+	if !chunked {
+		result, runErr := sctx.RunAgentContext(ctx, agent.RunOpts{
+			Prompt:     prompt,
+			CWD:        sctx.WorkDir,
+			Env:        sctx.Env,
+			JSONSchema: reviewFindingsSchema,
+			OnChunk:    sctx.LogChunk,
+			Purpose:    "review",
+			Workload:   workload,
+		})
+		if runErr != nil {
+			return nil, reviewAgentError(ctx, timeout, "agent review", runErr)
+		}
+		// Keep the existing text fallback for the unchunked review. A chunked
+		// review instead fails closed if any turn has no structured findings.
+		if result.Output != nil {
+			if err := json.Unmarshal(result.Output, &findings); err != nil {
+				sctx.Log("could not parse structured output, using text response")
+				findings = Findings{Summary: result.Text}
+			}
 		}
 	}
 
