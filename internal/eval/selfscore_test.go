@@ -2,6 +2,7 @@ package eval
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -76,7 +77,8 @@ func TestReplayReportsPlanAndPerResultProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if _, err := Capture(ctx, store, p, sourceDB, run.ID); err != nil {
+	captured, err := Capture(ctx, store, p, sourceDB, run.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,10 +86,13 @@ func TestReplayReportsPlanAndPerResultProgress(t *testing.T) {
 	var plannedCohort string
 	type progress struct{ completed, total int }
 	var results []progress
-	_, evaluations, err := Replay(ctx, store, ReplayOptions{
-		Set:       "labeled",
-		Candidate: Candidate{Agent: types.AgentClaude, Model: "test"},
-		Repeats:   2,
+	chunkOff := 0
+	session, evaluations, err := Replay(ctx, store, ReplayOptions{
+		Set:                       "labeled",
+		Candidate:                 Candidate{Agent: types.AgentClaude, Model: "test"},
+		Repeats:                   2,
+		CaseIDs:                   []string{captured[0].ID},
+		ReviewChunkThresholdLines: &chunkOff,
 		OnPlan: func(session Session, cases []Case) {
 			plannedCases = len(cases)
 			plannedCohort = session.Cohort
@@ -98,6 +103,9 @@ func TestReplayReportsPlanAndPerResultProgress(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.HasSuffix(session.Candidate, ",review_chunk_threshold_lines=0") || evaluations[0].Candidate != session.Candidate {
+		t.Fatalf("review context variant was not kept in candidate identity: session=%q evaluation=%q", session.Candidate, evaluations[0].Candidate)
 	}
 	if plannedCases != 1 || plannedCohort == "" {
 		t.Fatalf("plan callback saw %d case(s), cohort %q; want 1 case and a cohort", plannedCases, plannedCohort)

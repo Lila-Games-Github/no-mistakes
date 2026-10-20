@@ -160,6 +160,8 @@ func newEvalRunCmd() *cobra.Command {
 	var cases string
 	var candidateRaw string
 	var repeats int
+	var reviewChunkThreshold int
+	var caseIDs []string
 	cmd := &cobra.Command{
 		Use:   "run --cases <all|labeled|diversified|tune> --candidate <agent,model=...[,effort=...]>",
 		Short: "Replay captured review passes and score findings against gold",
@@ -176,10 +178,16 @@ func newEvalRunCmd() *cobra.Command {
 			defer store.Close()
 			out := cmd.OutOrStdout()
 			caseCount := 0
+			var chunkOverride *int
+			if cmd.Flags().Changed("review-chunk-threshold-lines") {
+				chunkOverride = &reviewChunkThreshold
+			}
 			session, evaluations, runErr := eval.Replay(cmd.Context(), store, eval.ReplayOptions{
-				Set:       cases,
-				Candidate: candidate,
-				Repeats:   repeats,
+				Set:                       cases,
+				Candidate:                 candidate,
+				Repeats:                   repeats,
+				CaseIDs:                   caseIDs,
+				ReviewChunkThresholdLines: chunkOverride,
 				OnPlan: func(session eval.Session, planned []eval.Case) {
 					caseCount = len(planned)
 					fmt.Fprintf(out, "replaying %d case(s) x %d repeat(s) with %s on %s (cohort %s)\n\n",
@@ -203,6 +211,8 @@ func newEvalRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cases, "cases", "", "case set: all, labeled (finding-level gold), diversified (official gold-only holdout), or tune")
 	cmd.Flags().StringVar(&candidateRaw, "candidate", "", eval.CandidateUsage())
 	cmd.Flags().IntVar(&repeats, "repeats", 3, "replays per case (minimum 1)")
+	cmd.Flags().IntVar(&reviewChunkThreshold, "review-chunk-threshold-lines", 0, "isolated replay override: 0 keeps one review turn; a value over 500 enables chunking above that diff size")
+	cmd.Flags().StringArrayVar(&caseIDs, "case", nil, "replay only this exact captured case ID (repeatable)")
 	_ = cmd.MarkFlagRequired("cases")
 	_ = cmd.MarkFlagRequired("candidate")
 	return cmd
