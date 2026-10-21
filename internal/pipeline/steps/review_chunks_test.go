@@ -19,7 +19,7 @@ func TestPlanReviewChunks_CoversEveryPatchByteAndPath(t *testing.T) {
 	first := "diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -0,0 +1 @@\n" + longLine
 	second := "diff --git a/small.txt b/small.txt\n--- a/small.txt\n+++ b/small.txt\n@@ -0,0 +1 @@\n+done\n"
 	patch := first + second
-	chunks, err := planReviewChunks(patch, []string{"large.txt", "small.txt"})
+	chunks, err := planReviewChunks(patch, []string{"large.txt", "small.txt"}, reviewChunkBudget{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,8 +48,85 @@ func TestPlanReviewChunks_CoversEveryPatchByteAndPath(t *testing.T) {
 	if strings.Join(paths, ",") != "large.txt,small.txt" {
 		t.Fatalf("covered paths = %q", paths)
 	}
-	if _, err := planReviewChunks(patch, []string{"large.txt"}); err == nil {
+	if _, err := planReviewChunks(patch, []string{"large.txt"}, reviewChunkBudget{}); err == nil {
 		t.Fatal("expected path-count mismatch to fail closed")
+	}
+}
+
+// twoThousandLinePatch mirrors the crew-board change that motivated the line
+// budget: about 2,000 changed lines in roughly 113 KB, which the default byte
+// budget plans as a single chunk.
+func twoThousandLinePatch() (string, []string) {
+	var b strings.Builder
+	var paths []string
+	sizes := []int{900, 600, 300, 150, 50}
+	for i, n := range sizes {
+		path := filepath.ToSlash(filepath.Join("bin", "file"+string(rune('a'+i))+".go"))
+		paths = append(paths, path)
+		b.WriteString("diff --git a/" + path + " b/" + path + "\n--- a/" + path + "\n+++ b/" + path + "\n")
+		for line := 0; line < n; line += 50 {
+			b.WriteString("@@ -1,0 +1,50 @@\n")
+			for j := 0; j < 50; j++ {
+				b.WriteString("+\tvalue := computeSomethingWithALongName(input, 42) // line\n")
+			}
+		}
+	}
+	return b.String(), paths
+}
+
+func TestPlanReviewChunks_LineBudgetSplitsALargeChangeIntoSeveralChunks(t *testing.T) {
+	patch, paths := twoThousandLinePatch()
+	if lines := changedLinesInPatch(patch); lines != 2000 {
+		t.Fatalf("fixture has %d changed lines, want 2000", lines)
+	}
+	defaultChunks, err := planReviewChunks(patch, paths, reviewChunkBudget{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultChunks) != 1 {
+		t.Fatalf("default budget planned %d chunks; the fixture should reproduce the single-chunk report", len(defaultChunks))
+	}
+
+	chunks, err := planReviewChunks(patch, paths, reviewChunkBudget{maxLines: 400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 5 {
+		t.Fatalf("a 400-line budget planned %d chunks for 2,000 lines, want at least 5", len(chunks))
+	}
+	var reconstructed strings.Builder
+	total := 0
+	for i, chunk := range chunks {
+		lines := chunk.workload().Lines
+		if lines > 400 {
+			t.Fatalf("chunk %d carries %d changed lines, budget 400", i+1, lines)
+		}
+		total += lines
+		for _, part := range chunk.parts {
+			reconstructed.WriteString(part.text)
+		}
+	}
+	if reconstructed.String() != patch {
+		t.Fatal("line-budget chunks lost or duplicated patch bytes")
+	}
+	if total != 2000 {
+		t.Fatalf("chunks cover %d changed lines, want 2000", total)
+	}
+}
+
+func TestPlanReviewChunks_ByteBudgetOverridesTheDefault(t *testing.T) {
+	patch, paths := twoThousandLinePatch()
+	chunks, err := planReviewChunks(patch, paths, reviewChunkBudget{maxBytes: 32 * 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 3 {
+		t.Fatalf("a 32 KiB budget planned %d chunks for a %d-byte patch", len(chunks), len(patch))
+	}
+	for i, chunk := range chunks {
+		if chunk.bytes > 32*1024 {
+			t.Fatalf("chunk %d is %d bytes, budget 32 KiB", i+1, chunk.bytes)
+		}
 	}
 }
 

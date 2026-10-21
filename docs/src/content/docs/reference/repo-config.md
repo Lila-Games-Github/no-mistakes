@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `review.chunk_threshold_lines`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `review.chunk_threshold_lines`, `review.chunk_max_lines`, `review.chunk_max_bytes`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -43,6 +43,8 @@ document:
 review:
   # Experimental opt-in for very large changes; 0 (the default) disables it.
   # chunk_threshold_lines: 5000
+  # chunk_max_lines: 400
+  # chunk_max_bytes: 65536
   path_instructions:
     - path: "internal/scm/**"
       instructions: |
@@ -320,7 +322,17 @@ Opt in to bounded, independent review turns when a diff has more than this many 
 
 The complete zero-context Git patch is partitioned in stable path order, with each turn receiving at most 128 KiB of patch text for diffs up to 1 MiB, or 256 KiB for broader diffs, and at most 96 paths. A file larger than a chunk continues in later turns with explicit byte offsets. In this opt-in mode, every changed path is assigned, including paths matching `ignore_patterns`. Each turn starts a fresh agent session, can inspect the full exact Git diff and related call sites, and returns structured findings. The step combines every turn's findings and highest risk; a missing or malformed turn fails the review. The whole review round still uses `review_agent_timeout`, so a large number of chunks may require a larger round budget.
 
+The per-turn budget above is the default. [`review.chunk_max_lines`](#reviewchunk_max_lines) and [`review.chunk_max_bytes`](#reviewchunk_max_bytes) tighten it, which matters when a change crosses the threshold but its patch fits one default-sized turn: a 2,000-line change in a 113 KB patch otherwise plans a single chunk.
+
 Use `no-mistakes eval run --case <id> --review-chunk-threshold-lines 0` and then the same command with a threshold above `500` to compare a captured case before enabling this setting. The replay override applies only in its isolated sandbox; it does not change the repository's gate config.
+
+### review.chunk_max_lines
+
+The most added plus deleted lines one chunked review turn covers. The default is `0`, which keeps the byte-only budget; a positive value must be at least `100`. A file with more changed lines than the budget continues in later turns at a line boundary, with the same explicit byte offsets as a byte split. It has an effect only while [`review.chunk_threshold_lines`](#reviewchunk_threshold_lines) activates chunked review, and it is read only from the trusted default-branch config. `no-mistakes eval run --review-chunk-max-lines <n>` applies a value in the isolated replay sandbox.
+
+### review.chunk_max_bytes
+
+The most patch bytes one chunked review turn receives, replacing the size-dependent default of 128 KiB (patches up to 1 MiB) or 256 KiB. The default is `0`, which keeps that default; a positive value must be at least `16384`. When both budgets are set, a turn closes at whichever it reaches first. It has an effect only while chunked review is active, and it is read only from the trusted default-branch config.
 
 ### Command process lifetime
 

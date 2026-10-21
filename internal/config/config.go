@@ -280,6 +280,13 @@ type ReviewRaw struct {
 	// the full change exceeds this many added plus deleted lines. Zero keeps
 	// the existing single-turn review, pending finding-recall evidence.
 	ChunkThresholdLines int `yaml:"chunk_threshold_lines"`
+	// ChunkMaxLines caps the added plus deleted lines one chunked review turn
+	// covers. Zero keeps the byte-only budget.
+	ChunkMaxLines int `yaml:"chunk_max_lines"`
+	// ChunkMaxBytes overrides the per-turn patch-byte budget. Zero keeps the
+	// size-dependent default (128 KiB per turn for patches up to 1 MiB,
+	// 256 KiB above).
+	ChunkMaxBytes int `yaml:"chunk_max_bytes"`
 }
 
 // PRRaw is the YAML representation of pull-request settings.
@@ -547,6 +554,8 @@ type Document struct {
 type Review struct {
 	PathInstructions    []PathInstruction
 	ChunkThresholdLines int
+	ChunkMaxLines       int
+	ChunkMaxBytes       int
 }
 
 // TestRaw is the YAML representation of test-step settings.
@@ -2030,6 +2039,13 @@ func validatePRRaw(pr PRRaw) error {
 	return nil
 }
 
+// Lower bounds for the chunked-review budget: below them a large change would
+// fan out into dozens of turns, each paying the fixed per-turn cost again.
+const (
+	MinReviewChunkMaxLines = 100
+	MinReviewChunkMaxBytes = 16 * 1024
+)
+
 // validateReviewRaw fails the config closed on a review.path_instructions list
 // the review step could not honor deterministically: a missing path or
 // instructions value, a glob the matcher cannot compile, or a list that would
@@ -2046,6 +2062,12 @@ func validatePRRaw(pr PRRaw) error {
 func validateReviewRaw(review ReviewRaw) error {
 	if review.ChunkThresholdLines < 0 || (review.ChunkThresholdLines > 0 && review.ChunkThresholdLines <= 500) {
 		return fmt.Errorf("review.chunk_threshold_lines must be 0 (disabled) or greater than 500")
+	}
+	if review.ChunkMaxLines < 0 || (review.ChunkMaxLines > 0 && review.ChunkMaxLines < MinReviewChunkMaxLines) {
+		return fmt.Errorf("review.chunk_max_lines must be 0 (byte budget only) or at least %d", MinReviewChunkMaxLines)
+	}
+	if review.ChunkMaxBytes < 0 || (review.ChunkMaxBytes > 0 && review.ChunkMaxBytes < MinReviewChunkMaxBytes) {
+		return fmt.Errorf("review.chunk_max_bytes must be 0 (default budget) or at least %d", MinReviewChunkMaxBytes)
 	}
 	if len(review.PathInstructions) > MaxReviewPathInstructions {
 		return fmt.Errorf("review.path_instructions has %d entries, at most %d are allowed", len(review.PathInstructions), MaxReviewPathInstructions)
@@ -2538,7 +2560,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Intent:         intent,
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
-		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines},
+		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines, ChunkMaxLines: repo.Review.ChunkMaxLines, ChunkMaxBytes: repo.Review.ChunkMaxBytes},
 		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
 		ForgeProfiles:  global.ForgeProfiles,
 		// repo is the EffectiveRepoConfig result, so this value is already

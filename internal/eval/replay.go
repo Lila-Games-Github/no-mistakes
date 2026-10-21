@@ -41,6 +41,10 @@ type ReplayOptions struct {
 	// this isolated replay. Nil preserves the captured configuration. Zero is
 	// the unchunked control; positive values must keep medium changes intact.
 	ReviewChunkThresholdLines *int
+	// ReviewChunkMaxLines overrides the captured per-turn changed-line budget
+	// of a chunked review in this isolated replay. Nil keeps the captured
+	// value; it is part of the candidate identity.
+	ReviewChunkMaxLines *int
 	// LeanTurns overrides whether the candidate agent gets the lean_turns
 	// measures in this isolated replay: true lists the candidate agent (with
 	// the captured or default bounds), false lists no agent. Nil preserves the
@@ -83,6 +87,9 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	if opts.ReviewChunkThresholdLines != nil && *opts.ReviewChunkThresholdLines != 0 && *opts.ReviewChunkThresholdLines <= 500 {
 		return Session{}, nil, fmt.Errorf("review chunk threshold must be 0 or greater than 500")
 	}
+	if opts.ReviewChunkMaxLines != nil && *opts.ReviewChunkMaxLines != 0 && *opts.ReviewChunkMaxLines < config.MinReviewChunkMaxLines {
+		return Session{}, nil, fmt.Errorf("review chunk max lines must be 0 or at least %d", config.MinReviewChunkMaxLines)
+	}
 	cases, session, err := store.prepareReplay(ctx, opts)
 	if err != nil {
 		return Session{}, nil, err
@@ -103,7 +110,7 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	var failed int
 	for repeat := 1; repeat <= opts.Repeats; repeat++ {
 		for _, c := range cases {
-			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, replayOverrides{chunkThreshold: opts.ReviewChunkThresholdLines, leanTurns: opts.LeanTurns}, repeat)
+			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, replayOverrides{chunkThreshold: opts.ReviewChunkThresholdLines, chunkMaxLines: opts.ReviewChunkMaxLines, leanTurns: opts.LeanTurns}, repeat)
 			if evaluation.Status != "completed" {
 				failed++
 			}
@@ -156,6 +163,9 @@ func (s *Store) prepareReplay(ctx context.Context, opts ReplayOptions) ([]Case, 
 	candidateName := opts.Candidate.String()
 	if opts.ReviewChunkThresholdLines != nil {
 		candidateName = fmt.Sprintf("%s,review_chunk_threshold_lines=%d", candidateName, *opts.ReviewChunkThresholdLines)
+	}
+	if opts.ReviewChunkMaxLines != nil {
+		candidateName = fmt.Sprintf("%s,review_chunk_max_lines=%d", candidateName, *opts.ReviewChunkMaxLines)
 	}
 	if opts.LeanTurns != nil {
 		state := "off"
@@ -232,6 +242,7 @@ func (s *Store) releaseReplayReservation(sessionID string) {
 // experiment varies; nil fields keep the captured configuration.
 type replayOverrides struct {
 	chunkThreshold *int
+	chunkMaxLines  *int
 	leanTurns      *bool
 }
 
@@ -307,6 +318,9 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 	}
 	if overrides.chunkThreshold != nil {
 		cfg.Review.ChunkThresholdLines = *overrides.chunkThreshold
+	}
+	if overrides.chunkMaxLines != nil {
+		cfg.Review.ChunkMaxLines = *overrides.chunkMaxLines
 	}
 	if overrides.leanTurns != nil {
 		cfg.LeanTurns.Agents = nil

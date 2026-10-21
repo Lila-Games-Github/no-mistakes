@@ -162,6 +162,7 @@ func newEvalRunCmd() *cobra.Command {
 	var repeats int
 	var reviewChunkThreshold int
 	var leanTurns string
+	var reviewChunkMaxLines int
 	var caseIDs []string
 	cmd := &cobra.Command{
 		Use:   "run --cases <all|labeled|diversified|tune> --candidate <agent,model=...[,effort=...]>",
@@ -183,6 +184,10 @@ func newEvalRunCmd() *cobra.Command {
 			if cmd.Flags().Changed("review-chunk-threshold-lines") {
 				chunkOverride = &reviewChunkThreshold
 			}
+			var chunkMaxLinesOverride *int
+			if cmd.Flags().Changed("review-chunk-max-lines") {
+				chunkMaxLinesOverride = &reviewChunkMaxLines
+			}
 			var leanOverride *bool
 			if cmd.Flags().Changed("lean-turns") {
 				switch leanTurns {
@@ -201,6 +206,7 @@ func newEvalRunCmd() *cobra.Command {
 				Repeats:                   repeats,
 				CaseIDs:                   caseIDs,
 				ReviewChunkThresholdLines: chunkOverride,
+				ReviewChunkMaxLines:       chunkMaxLinesOverride,
 				LeanTurns:                 leanOverride,
 				OnPlan: func(session eval.Session, planned []eval.Case) {
 					caseCount = len(planned)
@@ -226,6 +232,7 @@ func newEvalRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&candidateRaw, "candidate", "", eval.CandidateUsage())
 	cmd.Flags().IntVar(&repeats, "repeats", 3, "replays per case (minimum 1)")
 	cmd.Flags().IntVar(&reviewChunkThreshold, "review-chunk-threshold-lines", 0, "isolated replay override: 0 keeps one review turn; a value over 500 enables chunking above that diff size")
+	cmd.Flags().IntVar(&reviewChunkMaxLines, "review-chunk-max-lines", 0, "isolated replay override: changed lines per chunked review turn (0 keeps the byte budget only)")
 	cmd.Flags().StringVar(&leanTurns, "lean-turns", "", "isolated replay override: on applies lean_turns to the candidate agent, off disables it")
 	cmd.Flags().StringArrayVar(&caseIDs, "case", nil, "replay only this exact captured case ID (repeatable)")
 	_ = cmd.MarkFlagRequired("cases")
