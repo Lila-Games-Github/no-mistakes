@@ -94,6 +94,7 @@ func TestBuildDescribesLayoutCommandsAndToolchain(t *testing.T) {
 		"- go: available",
 		"- node: not on PATH",
 		"- shellcheck: not on PATH",
+		"- ruby: not on PATH",
 		"AGENTS.md sections: Agents; Testing; Release",
 	} {
 		if !strings.Contains(pack.Text, want) {

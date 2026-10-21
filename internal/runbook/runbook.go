@@ -174,6 +174,12 @@ var languageByExt = map[string]string{
 	".cs": "dotnet", ".swift": "swift", ".c": "c", ".cc": "c", ".cpp": "c", ".h": "c",
 }
 
+// commonTools are probed for every repository: test and fix agents reach for
+// them regardless of the repository's languages (a shell test suite that
+// parses YAML with ruby, a jq pipeline), and a measured pi test turn spent its
+// whole budget discovering that ruby was missing.
+var commonTools = []string{"git", "bash", "make", "python3", "node", "ruby", "jq", "yq", "shellcheck"}
+
 // toolsByLanguage are the binaries whose presence a fix round would
 // otherwise probe for with shell calls.
 var toolsByLanguage = map[string][]string{
@@ -245,8 +251,12 @@ func collect(entries []entry, in Inputs) facts {
 	if lookPath == nil {
 		lookPath = exec.LookPath
 	}
-	seen := map[string]bool{"git": true}
-	tools := []string{"git"}
+	seen := map[string]bool{}
+	var tools []string
+	for _, tool := range commonTools {
+		seen[tool] = true
+		tools = append(tools, tool)
+	}
 	langs := make([]string, 0, len(f.languages))
 	for lang := range f.languages {
 		langs = append(langs, lang)
