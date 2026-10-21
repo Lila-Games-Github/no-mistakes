@@ -200,3 +200,26 @@ func TestRunbookPromptSection_OptOutKeepsProjectInstructionsOut(t *testing.T) {
 		t.Fatalf("disable_project_settings must keep AGENTS.md out of the run-book:\n%s", got)
 	}
 }
+
+func TestTestAndDocumentSteps_RunbookFollowsLeanTurns(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"pi", "claude"} {
+		dir, baseSHA, headSHA := setupGitRepo(t)
+		ag := &mockAgent{name: name, runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"","tested":["go test ./x -count=1"],"testing_summary":"targeted check passed"}`)}, nil
+		}}
+		sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+		sctx.Config.LeanTurns = config.DefaultGlobalConfig().LeanTurns
+		sctx.UserIntent = "Keep doctor checks green"
+		if _, err := (&TestStep{}).Execute(sctx); err != nil {
+			t.Fatal(err)
+		}
+		docPrompt := (&DocumentStep{}).buildPrompt(sctx, baseSHA, "none", false)
+		for step, prompt := range map[string]string{"test": ag.calls[0].Prompt, "document": docPrompt} {
+			has := strings.Contains(prompt, "Repository run-book") && strings.Contains(prompt, "Turn economy")
+			if has != (name == "pi") {
+				t.Errorf("%s %s prompt carries the run-book = %v, want %v", name, step, has, name == "pi")
+			}
+		}
+	}
+}

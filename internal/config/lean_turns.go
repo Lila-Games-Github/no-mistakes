@@ -39,7 +39,7 @@ type LeanTurnsRaw struct {
 type LeanTurns struct {
 	Agents []types.AgentName
 	// Runbook feeds the cached repository run-book (internal/runbook) to
-	// review and review-fix turns.
+	// review, review-fix, test, document, and lint agent turns.
 	Runbook         bool
 	RunbookMaxBytes int
 	// IncrementalRereview scopes a post-fix re-review to the fix-round delta

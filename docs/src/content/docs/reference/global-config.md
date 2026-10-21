@@ -507,7 +507,7 @@ Turn-economy measures for harnesses that otherwise re-explore the repository and
 | Field                                         | Type     | Default | Description |
 | --------------------------------------------- | -------- | ------- | ----------- |
 | `lean_turns.agents`                           | `list`   | `[pi]`  | Agents the measures apply to; `[]` turns them all off |
-| `lean_turns.runbook`                          | `bool`   | `true`  | Add the cached repository run-book to review and review-fix prompts |
+| `lean_turns.runbook`                          | `bool`   | `true`  | Add the cached repository run-book to review, review-fix, test, document, and lint agent prompts |
 | `lean_turns.runbook_max_bytes`                | `int`    | `6000`  | Cap on the injected run-book; `0` is uncapped |
 | `lean_turns.incremental_rereview`             | `bool`   | `true`  | Start each post-fix re-review with a pass over the fix-round delta |
 | `lean_turns.fixer_session_max_context_tokens` | `int`    | `200000` | Retire the durable fixer session after a call carried more context than this; `0` never retires it |
