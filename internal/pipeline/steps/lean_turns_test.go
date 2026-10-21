@@ -78,7 +78,7 @@ func TestReviewStep_LeanRereviewReviewsTheDeltaThenRunsAFullPass(t *testing.T) {
 		t.Error("the completing pass must be full scope")
 	}
 	for name, prompt := range map[string]string{"fix": fix.Prompt, "delta": delta.Prompt, "full": full.Prompt} {
-		if !strings.Contains(prompt, "Repository run-book") || !strings.Contains(prompt, "configured commands.test: `make test`") {
+		if !strings.Contains(prompt, "Repository run-book") || !strings.Contains(prompt, "configured commands.test: `make test`") || !strings.Contains(prompt, "Batch independent reads") {
 			t.Errorf("%s prompt is missing the run-book", name)
 		}
 	}
@@ -151,7 +151,7 @@ func TestReviewStep_UnlistedAgentKeepsTheExistingReviewShape(t *testing.T) {
 		t.Fatalf("calls = %d, want the unchanged fix + full review", len(ag.calls))
 	}
 	for _, call := range ag.calls {
-		if strings.Contains(call.Prompt, "Repository run-book") || strings.Contains(call.Prompt, "Incremental re-review scope:") {
+		if strings.Contains(call.Prompt, "Repository run-book") || strings.Contains(call.Prompt, "Incremental re-review scope:") || strings.Contains(call.Prompt, "Turn economy") {
 			t.Fatalf("an agent not listed in lean_turns must get the unchanged prompt:\n%s", call.Prompt)
 		}
 	}

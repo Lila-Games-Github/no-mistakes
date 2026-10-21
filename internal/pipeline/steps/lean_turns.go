@@ -58,8 +58,19 @@ func runbookPromptSection(sctx *pipeline.StepContext, lean config.LeanTurns, bas
 		}
 		sctx.LogFile(fmt.Sprintf("repository run-book %s (%s, %d bytes)", pack.Key, source, len(pack.Text)))
 	}
-	return "\n" + pack.Text
+	return "\n" + pack.Text + leanTurnEconomyClause
 }
+
+// leanTurnEconomyClause rides with the run-book. On the measured pi run, 83 of
+// a fixer turn's 94 model calls carried a single tool call and files were read
+// in successive 100-line slices, so call count - at roughly 3-5 seconds of
+// model latency each - not tool time dominated the turn. It changes how the
+// agent gathers evidence, never what it must check.
+const leanTurnEconomyClause = `
+Turn economy (every model call costs seconds on this harness):
+- Batch independent reads, searches, and git queries into one response as parallel tool calls instead of issuing one per response.
+- Read a file once, whole or in large ranges, rather than in successive small slices, and do not re-read content already in context.
+`
 
 // incrementalRereviewDelta decides whether this review turn may start with a
 // delta-scoped pass, and returns the delta base and its changed paths. It

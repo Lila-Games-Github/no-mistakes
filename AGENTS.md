@@ -218,6 +218,14 @@ Safest local verification sequence after non-trivial changes:
 - `codex exec resume` has a narrower flag surface than `codex exec`, so an unsupported override fails the resume and falls back; the e2e fakeagent must keep parsing both codex argv shapes (`extractCodexPrompt`).
 - Regressions: `internal/pipeline/sessions_test.go`, `internal/pipeline/steps/review_session_test.go` (incl. `TestReviewLoop_RereviewNeverResumesTheSessionThatPrescribedItsFixes`), `TestReviewStep_RereviewTreatsFixRoundsAsPipelineAuthoredCode`, `internal/agent/session_test.go`.
 
+**Lean Turns (`lean_turns`, `internal/runbook`, `internal/pipeline/steps/lean_turns.go`)**
+
+- Global-only turn-economy measures applied only to listed agents (default `[pi]`), so claude/codex stay byte-identical unless an operator lists them; docs owner is `docs/src/content/docs/reference/global-config.md`.
+- The run-book is read from `Config.TrustedConfigSHA` (fallback: branch base) through git objects, never the worktree, cached under `<NM_HOME>/runbooks/<repoID>/` by input hash, and must omit the AGENTS.md/CLAUDE.md index under `disable_project_settings` or it bypasses the opt-out.
+- A delta-scoped re-review may only park a round; when it finds nothing blocking the full-scope review runs in the same round. Never let a delta pass complete the step on its own; only a human approval of its parked findings can, and coverage then rests on the round chain (each round's starting head is the previous round's reviewed head), so keep `ReviewStartingHeadSHA` set from `run.HeadSHA` at round start.
+- The fixer-session bound retires on `Result.PeakContextTokens`, which only pi reports today; adapters reporting 0 are never retired.
+- Regressions: `internal/runbook`, `internal/pipeline/steps/lean_turns_test.go`, `TestRunSessions_ContextBudgetRetiresAnOversizedSession`, `internal/config/config_lean_turns_test.go`, `TestReplayEnvKeepsHarnessConfigReachableUnderIsolatedHome`.
+
 **Recorded Human Decisions on Findings**
 
 - Approve, skip, and abort each record `selected_finding_ids = "[]"` plus `selection_source = user_declined` on a gated round with findings (`executor.go` `recordDeclinedRound`, `db.SetStepRoundDeclined`); a round with no findings records no decision. The conditional write must never erase an existing selection. User-facing semantics are owned by `docs/src/content/docs/reference/pipeline-steps.md`.

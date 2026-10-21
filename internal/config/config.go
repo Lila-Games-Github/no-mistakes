@@ -794,6 +794,19 @@ branch_sync_remote_timeout: "60s"
 # Set false to force every agent invocation cold.
 session_reuse: true
 
+# Turn-economy measures for slow harnesses, applied only to the listed agents
+# (every other agent is unchanged): a cached repository run-book in review and
+# fix prompts, a delta-first re-review after each fix round (a full-scope
+# review still runs before the step completes), a context bound on the durable
+# fixer session, and launching pi without its skills catalog.
+# lean_turns:
+#   agents: [pi]
+#   runbook: true
+#   runbook_max_bytes: 6000
+#   incremental_rereview: true
+#   fixer_session_max_context_tokens: 200000
+#   skip_skill_catalog: true
+
 # Log level for daemon output
 # Options: debug, info, warn, error
 log_level: info
