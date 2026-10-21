@@ -350,7 +350,7 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		SkipFixExecution:      fixing,
 		ReviewStartingHeadSHA: startingHeadSHA,
 		PreviousFindings:      previousFindings,
-		Env:                   []string{"NM_HOME=" + isolatedPaths.Root(), "HOME=" + isolatedHome},
+		Env:                   replayEnv(isolatedPaths.Root(), isolatedHome),
 		Log:                   func(string) {},
 		LogChunk:              func(string) {},
 		LogFile:               func(string) {},
@@ -404,6 +404,39 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 	evaluation.FalsePositiveGold = score.FalsePositiveGold
 	evaluation.Pending = score.Pending
 	return evaluation
+}
+
+// harnessConfigDirs are the agent harnesses' own configuration directories
+// (credentials, settings) that normally live under HOME, keyed by the
+// variable each harness reads to relocate them.
+var harnessConfigDirs = []struct{ env, rel string }{
+	{"CLAUDE_CONFIG_DIR", ".claude"},
+	{"CODEX_HOME", ".codex"},
+	{"PI_CODING_AGENT_DIR", filepath.Join(".pi", "agent")},
+}
+
+// replayEnv isolates HOME and NM_HOME for the replayed review while keeping
+// each harness's own configuration reachable. Without the pass-through a
+// harness that stores its login under HOME runs signed out: claude exits 1
+// with an empty stderr and pi reports no authenticated provider, so the
+// replay measures nothing. A harness variable the operator already set is
+// inherited unchanged, and a directory that does not exist is not invented.
+func replayEnv(nmHome, isolatedHome string) []string {
+	env := []string{"NM_HOME=" + nmHome, "HOME=" + isolatedHome}
+	realHome, err := os.UserHomeDir()
+	if err != nil || realHome == "" {
+		return env
+	}
+	for _, dir := range harnessConfigDirs {
+		if os.Getenv(dir.env) != "" {
+			continue
+		}
+		path := filepath.Join(realHome, dir.rel)
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			env = append(env, dir.env+"="+path)
+		}
+	}
+	return env
 }
 
 func replayRoundContext(p *paths.Paths, c Case, workDir string) (*db.DB, string, bool, string, error) {
