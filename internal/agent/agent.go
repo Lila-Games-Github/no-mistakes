@@ -225,6 +225,11 @@ type Result struct {
 	// durable session, so round N's counters include rounds 1..N-1. The pipeline
 	// uses it to record correct per-round token deltas (see PerRoundTokens).
 	SessionUsageCumulative bool
+	// PeakContextTokens is the largest prompt (input + cache read + cache
+	// write) any single model call of this invocation carried. 0 means the
+	// adapter does not report per-call usage. The review loop uses it to bound
+	// the durable fixer session's growth (lean_turns).
+	PeakContextTokens int
 }
 
 // TokenUsage tracks token consumption for an agent invocation.
@@ -270,6 +275,10 @@ type Options struct {
 	// harness on its own defaults, which is what every configuration that
 	// predates the common layer resolves to.
 	Profile agentcfg.Profile
+	// SkipSkillCatalog asks an adapter whose harness injects a skills catalog
+	// into every system prompt (pi) to launch without it (lean_turns).
+	// Adapters without such a catalog ignore it.
+	SkipSkillCatalog bool
 }
 
 func finalizeTextResult(agentName, text string, schema json.RawMessage, usage TokenUsage) (*Result, error) {
@@ -895,6 +904,7 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 			bin:                    bin,
 			extraArgs:              extraArgs,
 			disableProjectSettings: opts.DisableProjectSettings,
+			skipSkillCatalog:       opts.SkipSkillCatalog,
 			subprocessContext:      newSubprocessContext(opts.Environment),
 		}, nil
 	case types.AgentCopilot:

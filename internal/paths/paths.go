@@ -108,6 +108,11 @@ func (p *Paths) RunEvidenceDir(configured, runID string) string {
 	return filepath.Join(p.EvidenceRoot(configured), runID)
 }
 
+// RunbookDir holds one repository's cached run-books (internal/runbook).
+func (p *Paths) RunbookDir(repoID string) string {
+	return filepath.Join(p.root, "runbooks", repoID)
+}
+
 func (p *Paths) ReposDir() string { return filepath.Join(p.root, "repos") }
 func (p *Paths) RepoDir(repoID string) string {
 	return filepath.Join(p.root, "repos", repoID+".git")

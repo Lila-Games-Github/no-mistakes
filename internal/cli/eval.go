@@ -161,6 +161,7 @@ func newEvalRunCmd() *cobra.Command {
 	var candidateRaw string
 	var repeats int
 	var reviewChunkThreshold int
+	var leanTurns string
 	var caseIDs []string
 	cmd := &cobra.Command{
 		Use:   "run --cases <all|labeled|diversified|tune> --candidate <agent,model=...[,effort=...]>",
@@ -182,12 +183,25 @@ func newEvalRunCmd() *cobra.Command {
 			if cmd.Flags().Changed("review-chunk-threshold-lines") {
 				chunkOverride = &reviewChunkThreshold
 			}
+			var leanOverride *bool
+			if cmd.Flags().Changed("lean-turns") {
+				switch leanTurns {
+				case "on":
+					leanOverride = new(bool)
+					*leanOverride = true
+				case "off":
+					leanOverride = new(bool)
+				default:
+					return fmt.Errorf("--lean-turns must be on or off, got %q", leanTurns)
+				}
+			}
 			session, evaluations, runErr := eval.Replay(cmd.Context(), store, eval.ReplayOptions{
 				Set:                       cases,
 				Candidate:                 candidate,
 				Repeats:                   repeats,
 				CaseIDs:                   caseIDs,
 				ReviewChunkThresholdLines: chunkOverride,
+				LeanTurns:                 leanOverride,
 				OnPlan: func(session eval.Session, planned []eval.Case) {
 					caseCount = len(planned)
 					fmt.Fprintf(out, "replaying %d case(s) x %d repeat(s) with %s on %s (cohort %s)\n\n",
@@ -212,6 +226,7 @@ func newEvalRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&candidateRaw, "candidate", "", eval.CandidateUsage())
 	cmd.Flags().IntVar(&repeats, "repeats", 3, "replays per case (minimum 1)")
 	cmd.Flags().IntVar(&reviewChunkThreshold, "review-chunk-threshold-lines", 0, "isolated replay override: 0 keeps one review turn; a value over 500 enables chunking above that diff size")
+	cmd.Flags().StringVar(&leanTurns, "lean-turns", "", "isolated replay override: on applies lean_turns to the candidate agent, off disables it")
 	cmd.Flags().StringArrayVar(&caseIDs, "case", nil, "replay only this exact captured case ID (repeatable)")
 	_ = cmd.MarkFlagRequired("cases")
 	_ = cmd.MarkFlagRequired("candidate")

@@ -118,6 +118,14 @@ func NewExecutor(database *db.DB, p *paths.Paths, cfg *config.Config, ag agent.A
 	}
 }
 
+// runbookDir is where the repository's cached run-books live.
+func (e *Executor) runbookDir(repo *db.Repo) string {
+	if e.paths == nil || repo == nil || repo.ID == "" {
+		return ""
+	}
+	return e.paths.RunbookDir(repo.ID)
+}
+
 // runEvidenceDir resolves where this run's test evidence is written. The
 // executor is the single owner of that answer for the pipeline: steps read it
 // from StepContext rather than recomputing a path, which is what let the
@@ -312,6 +320,9 @@ func (e *Executor) prepareRestart(runID string, name types.StepName, currentInde
 func (e *Executor) initializeRunScopes(runID string) {
 	sessionsEnabled := e.config != nil && e.config.SessionReuse && e.agent != nil
 	e.sessions = NewRunSessions(e.db, runID, e.agent, sessionsEnabled)
+	if sessionsEnabled {
+		e.sessions.SetContextBudget(e.config.LeanTurnsFor(types.AgentName(e.agent.Name())).FixerSessionMaxContextTokens)
+	}
 	e.shared = &RunShared{}
 }
 
@@ -858,6 +869,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		Sessions:         e.sessions,
 		Shared:           e.shared,
 		EvidenceDir:      e.runEvidenceDir(run.ID),
+		RunbookDir:       e.runbookDir(repo),
 		Fixing:           state.fixing,
 		PreviousFindings: state.previousFindings,
 		Log:              writeLog,

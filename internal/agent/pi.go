@@ -23,6 +23,12 @@ type piAgent struct {
 	// disableProjectSettings is the resolved, trusted-only opt-out. When true,
 	// buildArgs suppresses pi's project-level AGENTS.md/CLAUDE.md discovery.
 	disableProjectSettings bool
+	// skipSkillCatalog launches pi without its skills catalog (lean_turns).
+	// Pi otherwise lists every installed skill in each call's system prompt;
+	// measured on a real run that was 34,175 of 39,040 system-prompt
+	// characters, resent on every model call, for skills no pipeline prompt
+	// asks for.
+	skipSkillCatalog bool
 	subprocessContext
 }
 
@@ -135,6 +141,9 @@ func (a *piAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) {
 	if err == nil {
 		res.Model = pp.model
 		res.ModelProvider = pp.provider
+		metrics := pp.metrics()
+		res.Metrics = &metrics
+		res.PeakContextTokens = pp.peakContextTokens
 	}
 	if err == nil && opts.Session != nil {
 		if pp.sessionID == "" {
@@ -189,6 +198,9 @@ func (a *piAgent) buildArgs(session *SessionRef) []string {
 			args = append(args, arg)
 		}
 	}
+	if a.skipSkillCatalog && !piOperatorChoseSkills(a.extraArgs) {
+		args = append(args, "--no-skills")
+	}
 	args = append(args, "--mode", "json")
 	switch {
 	case session == nil:
@@ -230,6 +242,22 @@ func piNoContextFilesArgIndex(args []string) int {
 		}
 	}
 	return -1
+}
+
+// piOperatorChoseSkills reports whether the operator's own pi arguments
+// already decide skill loading - either disabling it or naming a skill to
+// load - so the lean default never overrides an explicit choice.
+func piOperatorChoseSkills(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--no-skills", "-ns", "--skill":
+			return true
+		}
+		if piArgTakesValue(args[i]) {
+			i++
+		}
+	}
+	return false
 }
 
 func piNoContextFilesArg(arg string) bool {
@@ -281,6 +309,15 @@ type piParser struct {
 	usage          TokenUsage
 	seenUsage      map[string]struct{}
 	assistantError string
+
+	// Bounded activity evidence (see InvocationMetrics): one model round-trip
+	// per unique assistant message, tool calls from pi's tool_execution
+	// events, and the largest single call's prompt size.
+	roundtrips        int
+	toolCalls         int
+	toolCategories    ToolCategoryCounts
+	toolWaitMS        int64
+	peakContextTokens int
 }
 
 func (p *piParser) parse(ctx context.Context, r io.Reader) error {
@@ -332,6 +369,46 @@ func (p *piParser) handleEvent(event map[string]any) {
 		p.recordAssistantUsage(event["message"])
 	case "agent_end":
 		p.rememberAgentEnd(event["messages"])
+	case "tool_execution_start":
+		p.recordToolStart(event)
+	case "tool_execution_end":
+		if ms, ok := event["durationMs"].(float64); ok && ms > 0 {
+			p.toolWaitMS += int64(ms)
+		}
+	}
+}
+
+// recordToolStart classifies one tool execution into the bounded categories.
+// Only the category is kept, never the command or path.
+func (p *piParser) recordToolStart(event map[string]any) {
+	p.toolCalls++
+	name, _ := event["toolName"].(string)
+	switch name {
+	case "bash":
+		args, _ := event["args"].(map[string]any)
+		command, _ := args["command"].(string)
+		categories := ClassifyToolCommand(command)
+		if len(categories) == 0 {
+			p.toolCategories.Add(ToolOther)
+		}
+		for _, category := range categories {
+			p.toolCategories.Add(category)
+		}
+	case "read", "grep", "find", "ls":
+		p.toolCategories.Add(ToolRead)
+	case "edit", "write":
+		p.toolCategories.Add(ToolEdit)
+	default:
+		p.toolCategories.Add(ToolOther)
+	}
+}
+
+func (p *piParser) metrics() InvocationMetrics {
+	return InvocationMetrics{
+		ModelRoundtrips:  p.roundtrips,
+		ToolCalls:        p.toolCalls,
+		ToolCategories:   p.toolCategories,
+		SubprocessWaitMS: p.toolWaitMS,
 	}
 }
 
@@ -441,6 +518,10 @@ func (p *piParser) recordAssistantUsage(raw any) {
 	}
 	p.seenUsage[key] = struct{}{}
 	p.usage = piUsageAdd(p.usage, usage)
+	p.roundtrips++
+	if context := usage.InputTokens + usage.CacheReadTokens + usage.CacheCreationTokens; context > p.peakContextTokens {
+		p.peakContextTokens = context
+	}
 }
 
 func (p *piParser) handleAssistantEvent(raw any) {
@@ -563,9 +644,12 @@ func piIntField(m map[string]any, names ...string) int {
 
 func piUsageFrom(usage map[string]any) TokenUsage {
 	_, cacheCreationReported := usage["cacheWrite"]
+	_, reasoningReported := usage["reasoning"]
 	return TokenUsage{
 		Reported:              len(usage) > 0,
 		CacheCreationReported: cacheCreationReported,
+		ReasoningReported:     reasoningReported,
+		ReasoningTokens:       piIntField(usage, "reasoning"),
 		InputTokens:           piIntField(usage, "input"),
 		OutputTokens:          piIntField(usage, "output"),
 		CacheReadTokens:       piIntField(usage, "cacheRead"),
@@ -577,6 +661,8 @@ func piUsageAdd(a, b TokenUsage) TokenUsage {
 	return TokenUsage{
 		Reported:              a.Reported || b.Reported,
 		CacheCreationReported: a.CacheCreationReported || b.CacheCreationReported,
+		ReasoningReported:     a.ReasoningReported || b.ReasoningReported,
+		ReasoningTokens:       a.ReasoningTokens + b.ReasoningTokens,
 		InputTokens:           a.InputTokens + b.InputTokens,
 		OutputTokens:          a.OutputTokens + b.OutputTokens,
 		CacheReadTokens:       a.CacheReadTokens + b.CacheReadTokens,

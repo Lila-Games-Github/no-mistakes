@@ -155,6 +155,8 @@ type GlobalConfig struct {
 	// record replay provenance), never a repository policy. Keeping it out of
 	// RepoConfig means no pushed branch can enable, disable, or resize it.
 	Eval Eval
+	// LeanTurns is global-only for the same reason (see LeanTurns).
+	LeanTurns LeanTurns
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -183,6 +185,7 @@ type globalConfigRaw struct {
 	Intent                  IntentRaw                  `yaml:"intent"`
 	Test                    TestRaw                    `yaml:"test"`
 	Eval                    EvalRaw                    `yaml:"eval"`
+	LeanTurns               LeanTurnsRaw               `yaml:"lean_turns"`
 	ForgeProfiles           ForgeProfiles              `yaml:"forge_profiles"`
 }
 
@@ -503,6 +506,7 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	LeanTurns             LeanTurns
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
@@ -1574,6 +1578,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
+		LeanTurns:               leanTurnsDefaults(),
 	}
 }
 
@@ -1743,6 +1748,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if err := validateEvalRaw(raw.Eval); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	if err := validateLeanTurnsRaw(raw.LeanTurns); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -1856,6 +1864,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
+	applyLeanTurnsOverrides(&cfg.LeanTurns, &raw.LeanTurns)
 
 	return cfg, nil
 }
@@ -2507,6 +2516,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
+		LeanTurns:      global.LeanTurns,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,

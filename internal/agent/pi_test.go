@@ -611,3 +611,72 @@ sleep 30
 		t.Logf("got error: %v", err)
 	}
 }
+
+func TestPiAgent_BuildArgs_SkipSkillCatalogAddsNoSkills(t *testing.T) {
+	pa := &piAgent{bin: "pi", extraArgs: []string{"--provider", "openrouter"}, skipSkillCatalog: true}
+	if got, want := strings.Join(pa.buildArgs(nil), " "), "--provider openrouter --no-skills --mode json --no-session"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestPiAgent_BuildArgs_SkipSkillCatalogYieldsToOperatorSkillPins(t *testing.T) {
+	for _, tc := range []struct {
+		extra []string
+		want  string
+	}{
+		{[]string{"-ns"}, "-ns --mode json --no-session"},
+		{[]string{"--no-skills"}, "--no-skills --mode json --no-session"},
+		{[]string{"--skill", "/opt/review-skill"}, "--skill /opt/review-skill --mode json --no-session"},
+	} {
+		pa := &piAgent{bin: "pi", extraArgs: tc.extra, skipSkillCatalog: true}
+		if got := strings.Join(pa.buildArgs(nil), " "); got != tc.want {
+			t.Errorf("extra %v: args = %q, want %q", tc.extra, got, tc.want)
+		}
+	}
+}
+
+func TestNewWithOptions_PiSkipSkillCatalog(t *testing.T) {
+	created, err := NewWithOptions(types.AgentPi, "pi", nil, Options{SkipSkillCatalog: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pa, ok := created.(*piAgent); !ok || !pa.skipSkillCatalog {
+		t.Fatalf("pi agent = %#v, want skipSkillCatalog", created)
+	}
+}
+
+func TestPiParser_ReportsTurnMetricsReasoningAndPeakContext(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"message_end","message":{"role":"assistant","responseId":"r1","stopReason":"toolUse","content":[{"type":"toolCall","name":"bash","arguments":{"command":"git diff HEAD~1"}},{"type":"toolCall","name":"read","arguments":{"path":"a.go"}}],"usage":{"input":100,"output":20,"cacheRead":900,"cacheWrite":0,"reasoning":15}}}`,
+		`{"type":"turn_end","message":{"role":"assistant","responseId":"r1","stopReason":"toolUse","content":[{"type":"toolCall","name":"bash","arguments":{"command":"git diff HEAD~1"}},{"type":"toolCall","name":"read","arguments":{"path":"a.go"}}],"usage":{"input":100,"output":20,"cacheRead":900,"cacheWrite":0,"reasoning":15}}}`,
+		`{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"git diff HEAD~1"}}`,
+		`{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","isError":false,"durationMs":40}`,
+		`{"type":"tool_execution_start","toolCallId":"c2","toolName":"read","args":{"path":"a.go"}}`,
+		`{"type":"tool_execution_end","toolCallId":"c2","toolName":"read","isError":false,"durationMs":2}`,
+		`{"type":"message_end","message":{"role":"assistant","responseId":"r2","stopReason":"toolUse","content":[{"type":"toolCall","name":"edit","arguments":{"path":"a.go"}}],"usage":{"input":50,"output":10,"cacheRead":1500,"cacheWrite":10,"reasoning":5}}}`,
+		`{"type":"tool_execution_start","toolCallId":"c3","toolName":"edit","args":{"path":"a.go"}}`,
+		`{"type":"tool_execution_end","toolCallId":"c3","toolName":"edit","isError":false,"durationMs":3}`,
+		`{"type":"message_end","message":{"role":"assistant","responseId":"r3","stopReason":"stop","content":[{"type":"text","text":"done"}],"usage":{"input":5,"output":2,"cacheRead":1200,"cacheWrite":0,"reasoning":0}}}`,
+	}, "\n")
+
+	pp := &piParser{}
+	if err := pp.parse(context.Background(), strings.NewReader(stream)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !pp.usage.ReasoningReported || pp.usage.ReasoningTokens != 20 {
+		t.Fatalf("reasoning = %d (reported %v), want 20", pp.usage.ReasoningTokens, pp.usage.ReasoningReported)
+	}
+	if pp.peakContextTokens != 1560 {
+		t.Fatalf("peak context = %d, want the largest single call (50+1500+10)", pp.peakContextTokens)
+	}
+	m := pp.metrics()
+	if m.ModelRoundtrips != 3 || m.ToolCalls != 3 {
+		t.Fatalf("metrics = %+v, want 3 model calls and 3 tool calls", m)
+	}
+	if m.ToolCategories.Git != 1 || m.ToolCategories.Read != 1 || m.ToolCategories.Edit != 1 {
+		t.Fatalf("tool categories = %+v", m.ToolCategories)
+	}
+	if m.SubprocessWaitMS != 45 {
+		t.Fatalf("subprocess wait = %d, want 45", m.SubprocessWaitMS)
+	}
+}

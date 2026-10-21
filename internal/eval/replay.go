@@ -41,8 +41,13 @@ type ReplayOptions struct {
 	// this isolated replay. Nil preserves the captured configuration. Zero is
 	// the unchunked control; positive values must keep medium changes intact.
 	ReviewChunkThresholdLines *int
-	OnPlan                    func(session Session, cases []Case)
-	OnResult                  func(evaluation Evaluation, completed, total int)
+	// LeanTurns overrides whether the candidate agent gets the lean_turns
+	// measures in this isolated replay: true lists the candidate agent (with
+	// the captured or default bounds), false lists no agent. Nil preserves the
+	// captured configuration. The override is part of the candidate identity.
+	LeanTurns *bool
+	OnPlan    func(session Session, cases []Case)
+	OnResult  func(evaluation Evaluation, completed, total int)
 }
 
 // Session records the immutable local plan used for one replay batch.
@@ -98,7 +103,7 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	var failed int
 	for repeat := 1; repeat <= opts.Repeats; repeat++ {
 		for _, c := range cases {
-			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, opts.ReviewChunkThresholdLines, repeat)
+			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, replayOverrides{chunkThreshold: opts.ReviewChunkThresholdLines, leanTurns: opts.LeanTurns}, repeat)
 			if evaluation.Status != "completed" {
 				failed++
 			}
@@ -151,6 +156,13 @@ func (s *Store) prepareReplay(ctx context.Context, opts ReplayOptions) ([]Case, 
 	candidateName := opts.Candidate.String()
 	if opts.ReviewChunkThresholdLines != nil {
 		candidateName = fmt.Sprintf("%s,review_chunk_threshold_lines=%d", candidateName, *opts.ReviewChunkThresholdLines)
+	}
+	if opts.LeanTurns != nil {
+		state := "off"
+		if *opts.LeanTurns {
+			state = "on"
+		}
+		candidateName = fmt.Sprintf("%s,lean_turns=%s", candidateName, state)
 	}
 	session := Session{ID: newSessionID(), StartedAt: time.Now().UTC(), Set: opts.Set, Candidate: candidateName, Repeats: opts.Repeats}
 	for _, c := range cases {
@@ -216,7 +228,14 @@ func (s *Store) releaseReplayReservation(sessionID string) {
 	_, _ = s.db.Exec(`DELETE FROM replay_case_reservations WHERE session_id = ?`, sessionID)
 }
 
-func replayOne(ctx context.Context, store *Store, c Case, session Session, candidate Candidate, chunkThreshold *int, repeat int) (evaluation Evaluation) {
+// replayOverrides are the isolated-replay configuration overrides a paired
+// experiment varies; nil fields keep the captured configuration.
+type replayOverrides struct {
+	chunkThreshold *int
+	leanTurns      *bool
+}
+
+func replayOne(ctx context.Context, store *Store, c Case, session Session, candidate Candidate, overrides replayOverrides, repeat int) (evaluation Evaluation) {
 	started := time.Now()
 	evaluation = Evaluation{
 		ID:        newSessionID(),
@@ -286,8 +305,14 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		evaluation.CompletedAt = time.Now().Unix()
 		return evaluation
 	}
-	if chunkThreshold != nil {
-		cfg.Review.ChunkThresholdLines = *chunkThreshold
+	if overrides.chunkThreshold != nil {
+		cfg.Review.ChunkThresholdLines = *overrides.chunkThreshold
+	}
+	if overrides.leanTurns != nil {
+		cfg.LeanTurns.Agents = nil
+		if *overrides.leanTurns {
+			cfg.LeanTurns.Agents = []types.AgentName{candidate.Agent}
+		}
 	}
 	cfg.Agent = candidate.Agent
 	cfg.Agents = []types.AgentName{candidate.Agent}
@@ -301,6 +326,7 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 		DisableProjectSettings: cfg.DisableProjectSettings,
 		Profile:                candidate.Profile(),
+		SkipSkillCatalog:       cfg.LeanTurnsFor(candidate.Agent).SkipSkillCatalog,
 	})
 	if err != nil {
 		evaluation.Error = safeurl.RedactText(fmt.Sprintf("create candidate agent: %v", err))
