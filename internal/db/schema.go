@@ -119,7 +119,9 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     tool_other_calls      INTEGER,
     workload_files        INTEGER,
     workload_lines        INTEGER,
-    finding_count         INTEGER
+    finding_count         INTEGER,
+    schema_reasks         INTEGER,
+    schema_repaired       INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_invocations_run_started_id
@@ -252,4 +254,8 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	// Structured-output recovery counters (nullable: NULL for rows that asked
+	// for no structured output and for rows recorded before the columns).
+	`ALTER TABLE agent_invocations ADD COLUMN schema_reasks INTEGER`,
+	`ALTER TABLE agent_invocations ADD COLUMN schema_repaired       INTEGER`,
 }

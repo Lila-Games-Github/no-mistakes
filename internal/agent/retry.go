@@ -101,13 +101,14 @@ func emitAgentAttempt(opts RunOpts, name string, result *Result, err error, star
 		return
 	}
 	opts.OnAttempt(Attempt{
-		Agent:           name,
-		Result:          result,
-		Err:             err,
-		StartedAt:       startedAt,
-		CompletedAt:     completedAt,
-		Session:         cloneSessionRef(opts.Session),
-		SessionFallback: opts.SessionFallback,
+		Agent:                 name,
+		Result:                result,
+		Err:                   err,
+		StartedAt:             startedAt,
+		CompletedAt:           completedAt,
+		Session:               cloneSessionRef(opts.Session),
+		SessionFallback:       opts.SessionFallback,
+		StructuredOutputReask: opts.StructuredOutputReask,
 	})
 }
 

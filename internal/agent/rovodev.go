@@ -27,8 +27,10 @@ func (a *rovodevAgent) Name() string { return "rovodev" }
 func (a *rovodevAgent) ReportsAgentAttempts() bool { return true }
 
 func (a *rovodevAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
-	return runWithRetry(ctx, "rovodev", opts, claudeMaxRetries, classifyTransient, a.recoverTransientRetry, func() (*Result, error) {
-		return a.runOnce(ctx, opts)
+	return runWithStructuredOutputReask(ctx, "rovodev", opts, func(opts RunOpts) (*Result, error) {
+		return runWithRetry(ctx, "rovodev", opts, claudeMaxRetries, classifyTransient, a.recoverTransientRetry, func() (*Result, error) {
+			return a.runOnce(ctx, opts)
+		})
 	})
 }
 

@@ -40,8 +40,10 @@ func (a *antigravityAgent) SupportsSessionProvider(provider string) bool {
 }
 
 func (a *antigravityAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
-	return runWithRetry(ctx, "antigravity", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
-		return a.runOnce(ctx, opts)
+	return runWithStructuredOutputReask(ctx, "antigravity", opts, func(opts RunOpts) (*Result, error) {
+		return runWithRetry(ctx, "antigravity", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
+			return a.runOnce(ctx, opts)
+		})
 	})
 }
 

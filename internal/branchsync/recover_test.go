@@ -1884,3 +1884,104 @@ func TestRecoverSquashedPreservedHeadStillEscalatesForDroppedLocalWork(t *testin
 		t.Fatal("dropped-work escalation stamped custody")
 	}
 }
+
+// TestFailedRunWithUnprovableRebasedHeadStaysRecoverable is the regression for
+// a review step that failed after fix rounds: the pipeline head was a rebase
+// of the submitted branch whose fix rewrote the operator's own line, so no
+// containment proof exists. The head is still the pipeline's own and pinned in
+// the gate, so inspection must never call it missing and must offer a
+// supported exit that lets a fresh run start - both from the untouched
+// submitted head and after the operator cherry-picked commits the gate never
+// saw.
+func TestFailedRunWithUnprovableRebasedHeadStaysRecoverable(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		cherryPickFix bool
+	}{
+		{name: "local at submitted head"},
+		{name: "local follow-up commit unknown to the gate", cherryPickFix: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newRecoverFixture(t, types.RunFailed)
+			pipeline := filepath.Join(t.TempDir(), "rebased")
+			mustRun(t, f.local, "-c", "core.autocrlf=false", "clone", f.gate, pipeline)
+			configureIdentity(t, pipeline)
+			mustRun(t, pipeline, "checkout", "-B", "rebased", f.base)
+			mustWrite(t, filepath.Join(pipeline, "upstream.txt"), "main moved\n")
+			mustRun(t, pipeline, "add", "upstream.txt")
+			mustRun(t, pipeline, "commit", "-m", "main moved")
+			mustWrite(t, filepath.Join(pipeline, "file.txt"), "feature rewritten by a review fix\n")
+			mustRun(t, pipeline, "commit", "-am", "feature (rebased, fixed)")
+			rebased := mustRun(t, pipeline, "rev-parse", "HEAD")
+			mustRun(t, pipeline, "push", "--force", "origin", "HEAD:refs/heads/feature/recover")
+			if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunFailed, rebased); err != nil {
+				t.Fatal(err)
+			}
+			mustRun(t, f.gate, "update-ref", f.anchorRef(), rebased)
+			if preservedContainsLocalWork(f.ctx, f.gate, f.submitted, rebased) {
+				t.Fatal("fixture must model a rebase whose containment cannot be proven")
+			}
+			if tc.cherryPickFix {
+				mustWrite(t, filepath.Join(f.local, "file.txt"), "feature fixed by hand\n")
+				mustRun(t, f.local, "commit", "-am", "cherry-picked review fix")
+			}
+			localHead := mustRun(t, f.local, "rev-parse", "HEAD")
+
+			inspected := f.service.InspectCached(f.ctx)
+			if inspected.Safety == "blocked_recover_preserved_head_missing" {
+				t.Fatalf("pipeline-produced head reported missing: %#v", inspected)
+			}
+			if inspected.State != StatePipelineOwned || inspected.Safety != "blocked_pipeline_owned_diverged" || inspected.Relation != RelationDiverged {
+				t.Fatalf("diverged failed run = %#v", inspected)
+			}
+			if inspected.NextAction == nil || inspected.NextAction.Code != "recover_custody_keep_local" || inspected.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+				t.Fatalf("diverged failed run next action = %#v", inspected.NextAction)
+			}
+			if !strings.Contains(inspected.Error, f.anchorRef()) || !strings.Contains(inspected.Error, "no-mistakes rerun") {
+				t.Fatalf("diverged failed run error does not name the anchor and the rerun exit: %q", inspected.Error)
+			}
+
+			kept := f.service.Recover(f.ctx, true)
+			if !kept.Recovered || kept.Changed {
+				t.Fatalf("advertised keep-local recovery = %#v", kept)
+			}
+			if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != localHead {
+				t.Fatalf("keep-local moved HEAD to %s, want %s", got, localHead)
+			}
+			if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != rebased {
+				t.Fatalf("pipeline head not reachable in the checkout after recovery: %s", got)
+			}
+			if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != rebased {
+				t.Fatalf("gate lost the pipeline head anchor: %s", got)
+			}
+			if !f.custodyReturned() {
+				t.Fatal("keep-local did not return custody, so a fresh run stays blocked")
+			}
+		})
+	}
+}
+
+// TestFailedRunDirtyBehindNamesBothRecoveryExits: a dirty worktree behind the
+// preserved head is not a missing head either; status names the clean-up and
+// both recovery commands.
+func TestFailedRunDirtyBehindNamesBothRecoveryExits(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustWrite(t, filepath.Join(f.local, "file.txt"), "dirty\n")
+
+	state := f.service.InspectCached(f.ctx)
+	if state.Safety != "blocked_pipeline_owned_dirty" {
+		t.Fatalf("dirty behind failed run = %#v", state)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "inspect_worktree" {
+		t.Fatalf("dirty behind next action = %#v", state.NextAction)
+	}
+	if !strings.Contains(state.Error, "no-mistakes axi sync --recover") || !strings.Contains(state.Error, "--keep-local") {
+		t.Fatalf("dirty behind error not actionable: %q", state.Error)
+	}
+}

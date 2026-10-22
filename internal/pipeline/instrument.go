@@ -54,6 +54,7 @@ func (a *perfRecordingAgent) Run(ctx context.Context, opts agent.RunOpts) (*agen
 		attemptOpts := opts
 		attemptOpts.Session = attempt.Session
 		attemptOpts.SessionFallback = attempt.SessionFallback
+		attemptOpts.StructuredOutputReask = attempt.StructuredOutputReask
 		a.record(ctx, attemptOpts, attempt.Agent, attempt.Result, attempt.Err, attempt.StartedAt, attempt.CompletedAt)
 	}
 	contextBytes := len(opts.Prompt) + len(opts.JSONSchema)
@@ -108,6 +109,7 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 		inv.WorkloadLines = &lines
 	}
 	a.recordResult(&inv, sessionKey, result)
+	recordStructuredOutputRecovery(&inv, opts, result)
 	if runErr != nil {
 		if ctx.Err() != nil || errors.Is(runErr, context.Canceled) {
 			inv.ExitStatus = "cancelled"
@@ -193,6 +195,28 @@ func (a *perfRecordingAgent) recordResult(inv *db.AgentInvocation, sessionKey st
 	if count, ok := countOutputFindings(result.Output); ok {
 		inv.FindingCount = &count
 	}
+}
+
+// recordStructuredOutputRecovery stamps the structured-output re-ask and local
+// repair counters. A re-ask attempt row counts its own re-ask; a single
+// whole-invocation row (adapters that report no attempts) counts the re-asks
+// its result needed. Rows that requested no structured output stay NULL.
+func recordStructuredOutputRecovery(inv *db.AgentInvocation, opts agent.RunOpts, result *agent.Result) {
+	if len(opts.JSONSchema) == 0 {
+		return
+	}
+	reasks, repaired := 0, 0
+	if result != nil {
+		reasks = result.StructuredOutputReasks
+		if result.StructuredOutputRepaired {
+			repaired = 1
+		}
+	}
+	if opts.StructuredOutputReask && reasks == 0 {
+		reasks = 1
+	}
+	inv.StructuredOutputReasks = &reasks
+	inv.StructuredOutputRepaired = &repaired
 }
 
 // countOutputFindings returns the number of findings in a structured output
