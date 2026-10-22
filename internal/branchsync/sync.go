@@ -1434,10 +1434,32 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 	state.Pipeline.Phase = "pre_push"
 	state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, run.HeadSHA)
 	if terminalRunStatus(run.Status) {
-		if !s.recoverySourceAvailable(ctx, state, run) {
+		anchor := custody.RecoveryRef(run.ID)
+		switch s.recoverySource(ctx, state, run) {
+		case recoverySourceMissing:
 			state.Safety = "blocked_recover_preserved_head_missing"
 			state.Error = "the run finished " + string(run.Status) + " but its recorded pipeline head is not available in the invoking worktree or local gate; inspect and reconcile the recorded and live heads manually"
 			state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
+			return
+		case recoverySourceNeedsCleanWorktree:
+			// The preserved head is safe in the gate and recovery could take it,
+			// but only over a clean worktree. Name both supported exits so the
+			// branch is never left without a way to start again.
+			state.Safety = "blocked_pipeline_owned_dirty"
+			state.Error = "the run finished " + string(run.Status) + " with unpublished pipeline commits preserved at " + anchor + " in the local gate, but the invoking worktree is not clean (" + state.Local.Reason + "); commit or stash, then run `no-mistakes axi sync --recover` to take the preserved head, or run `no-mistakes axi sync --recover --keep-local` to keep the current head (the preserved commits stay anchored)"
+			state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
+			return
+		case recoverySourceDiverged:
+			// The pipeline produced this head and the gate still pins it, but
+			// nothing proves adopting it keeps every local change (a pipeline
+			// rebase whose fix rounds rewrote lines, or local follow-up commits).
+			// That is not a missing head: keep-local returns custody without
+			// touching the worktree, and Recover fetches the preserved head into
+			// this checkout's anchor first, so nothing the pipeline made is lost.
+			state.Relation = RelationDiverged
+			state.Safety = "blocked_pipeline_owned_diverged"
+			state.Error = "the run finished " + string(run.Status) + " with unpublished pipeline commits preserved at " + anchor + " in the local gate, but the local branch has diverged from them and they cannot be adopted without risking local work; run `no-mistakes axi sync --recover --keep-local` to keep the current head (the preserved commits are anchored at " + anchor + " in this checkout too), or `no-mistakes rerun` to resume validating the preserved head"
+			state.NextAction = &NextAction{Code: "recover_custody_keep_local", Command: "no-mistakes axi sync --recover --keep-local"}
 			return
 		}
 		state.Safety = "blocked_pipeline_owned_recoverable"
@@ -1450,22 +1472,39 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 	state.NextAction = &NextAction{Code: "continue_active_run", Command: "no-mistakes axi status"}
 }
 
-func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run *db.Run) bool {
+// recoverySourceKind is what inspection can prove about a terminal run's
+// preserved head before advertising a custody action.
+type recoverySourceKind int
+
+const (
+	// recoverySourceMissing: the head is absent, or its evidence conflicts.
+	recoverySourceMissing recoverySourceKind = iota
+	// recoverySourceReady: Recover will return custody with the preserved head.
+	recoverySourceReady
+	// recoverySourceNeedsCleanWorktree: the gate pins the head and Recover could
+	// take it, but the worktree is dirty.
+	recoverySourceNeedsCleanWorktree
+	// recoverySourceDiverged: the gate pins the head, but adopting it is not
+	// provably lossless; --keep-local is the supported exit.
+	recoverySourceDiverged
+)
+
+func (s *Service) recoverySource(ctx context.Context, state *State, run *db.Run) recoverySourceKind {
 	if state == nil || run == nil || strings.TrimSpace(run.HeadSHA) == "" {
-		return false
+		return recoverySourceMissing
 	}
 	localAnchor := custody.RecoveryRef(run.ID)
 	_, localAnchorExists, err := git.ExactRefTarget(ctx, s.workDir(), localAnchor)
 	if err != nil {
-		return false
+		return recoverySourceMissing
 	}
 	if localAnchorExists {
 		anchored, err := git.Run(ctx, s.workDir(), "rev-parse", localAnchor+"^{commit}")
 		if err != nil || anchored != run.HeadSHA {
-			return false
+			return recoverySourceMissing
 		}
 	} else if target, err := git.Run(ctx, s.workDir(), "symbolic-ref", "-q", localAnchor); err == nil && target != "" {
-		return false
+		return recoverySourceMissing
 	}
 	local := state.Local.Head
 	preserved := run.HeadSHA
@@ -1473,34 +1512,47 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 	if localEligible {
 		localPreRecovery := custody.RecoveryLocalRef(run.ID)
 		if anchored, err := git.Run(ctx, s.workDir(), "rev-parse", "--verify", localPreRecovery+"^{commit}"); err == nil && anchored != preserved && local == preserved && !state.Local.Clean {
-			return false
+			return recoverySourceMissing
 		}
+	}
+	ready := func(ok bool) recoverySourceKind {
+		if ok {
+			return recoverySourceReady
+		}
+		return recoverySourceMissing
 	}
 
 	gateDir := strings.TrimSpace(s.GateDir)
 	if gateDir == "" {
-		return localEligible
+		return ready(localEligible)
 	}
 	if _, err := os.Stat(gateDir); err != nil {
-		return localEligible
+		return ready(localEligible)
 	}
 	compatible, err := recoveryAnchorCompatible(ctx, gateDir, run.ID, preserved)
 	if err != nil || !compatible {
-		return false
+		return recoverySourceMissing
 	}
 	if localEligible {
-		return true
+		return recoverySourceReady
 	}
 	if !objectExists(ctx, gateDir, run.HeadSHA) {
-		return false
+		return recoverySourceMissing
 	}
-	if !state.Local.Clean || !objectExists(ctx, gateDir, local) {
-		return false
+	// From here the gate provably holds the preserved head behind a
+	// compatible run anchor, so every remaining outcome has a supported exit.
+	// A local head the gate never received cannot be behind the preserved head
+	// (an ancestor would be in the gate), so it is diverged.
+	if !objectExists(ctx, gateDir, local) {
+		return recoverySourceDiverged
 	}
-	if isAncestor(ctx, gateDir, local, preserved) {
-		return true
+	if !isAncestor(ctx, gateDir, local, preserved) && !preservedContainsLocalWork(ctx, gateDir, local, preserved) {
+		return recoverySourceDiverged
 	}
-	return preservedContainsLocalWork(ctx, gateDir, local, preserved)
+	if !state.Local.Clean {
+		return recoverySourceNeedsCleanWorktree
+	}
+	return recoverySourceReady
 }
 
 func localRecoveryEligible(ctx context.Context, wd string, state *State, run *db.Run) bool {

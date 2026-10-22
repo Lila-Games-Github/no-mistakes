@@ -44,6 +44,10 @@ var canonicalBranchSyncPhrases = []string{
 	"recover_custody",
 	"no-mistakes axi sync --recover",
 	"preserved in the local gate",
+	// A failed run whose preserved head diverged from the branch must still
+	// leave a supported exit, never a dead end (nm-pi-structured-output-retry).
+	"recover_custody_keep_local",
+	"no-mistakes axi sync --recover --keep-local",
 	// Cancellation releases a run that never changed the submitted head
 	// (v1.44.2 dogfood catch): every surface must name the released state and
 	// that it needs no recovery.

@@ -630,10 +630,12 @@ func TestOpencodeAgent_ThinkingToolChoiceFallbackRejectsSchemaViolation(t *testi
 	if !strings.Contains(err.Error(), "summary must be string") {
 		t.Fatalf("error = %q, want original schema's string constraint", err)
 	}
-	if got := sessions.Load(); got != 2 {
-		t.Fatalf("sessions = %d, want 2", got)
+	// Initial turn, prompt-only fallback, then the single structured-output
+	// re-ask (which this server refuses), so the violation still fails the run.
+	if got := sessions.Load(); got != 3 {
+		t.Fatalf("sessions = %d, want 3", got)
 	}
-	t.Logf("two attempts completed; invalid fallback rejected: %v", err)
+	t.Logf("fallback and re-ask completed; invalid fallback rejected: %v", err)
 }
 
 func TestOpencodeAgent_ThinkingToolChoiceConflictFromSSEFallsBackOnce(t *testing.T) {

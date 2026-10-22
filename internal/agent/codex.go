@@ -53,8 +53,10 @@ func (a *codexAgent) NeutralizesGateInstructions() bool {
 }
 
 func (a *codexAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
-	return runWithRetry(ctx, "codex", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
-		return a.runOnce(ctx, opts)
+	return runWithStructuredOutputReask(ctx, "codex", opts, func(opts RunOpts) (*Result, error) {
+		return runWithRetry(ctx, "codex", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
+			return a.runOnce(ctx, opts)
+		})
 	})
 }
 
@@ -153,6 +155,7 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 		res.Metrics = &m
 		res.Model, res.ModelProvider = resolveCodexModel(threadID, time.Now())
 	}
+	err = withStructuredOutputSession(err, opts, threadID)
 	emitAgentExited(opts, "codex", pid, err)
 	return res, err
 }

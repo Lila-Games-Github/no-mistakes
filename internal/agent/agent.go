@@ -57,6 +57,10 @@ type RunOpts struct {
 	// fallback-provider attempts, after it completes. It is instrumentation
 	// only and must not change invocation behavior.
 	OnAttempt func(Attempt)
+	// StructuredOutputReask marks the single corrective re-ask issued after
+	// this invocation's structured output failed to parse or validate (see
+	// runWithStructuredOutputReask). Instrumentation only; adapters ignore it.
+	StructuredOutputReask bool
 }
 
 // Attempt describes one completed concrete adapter attempt for an agent
@@ -70,6 +74,9 @@ type Attempt struct {
 	CompletedAt     time.Time
 	Session         *SessionRef
 	SessionFallback bool
+	// StructuredOutputReask reports that this attempt was the corrective
+	// re-ask after a structured-output failure.
+	StructuredOutputReask bool
 }
 
 // SessionRef identifies a durable adapter-native session for RunOpts.Session.
@@ -230,6 +237,12 @@ type Result struct {
 	// adapter does not report per-call usage. The review loop uses it to bound
 	// the durable fixer session's growth (lean_turns).
 	PeakContextTokens int
+	// StructuredOutputRepaired reports that the final text only parsed after a
+	// local mechanical repair (see repairStructuredText).
+	StructuredOutputRepaired bool
+	// StructuredOutputReasks counts the corrective re-asks this invocation
+	// needed before its structured output was accepted (at most one).
+	StructuredOutputReasks int
 }
 
 // TokenUsage tracks token consumption for an agent invocation.
@@ -290,11 +303,23 @@ func finalizeTextResult(agentName, text string, schema json.RawMessage, usage To
 	}
 
 	output, err := parseStructuredTextOutput(text, schema)
+	repaired := false
 	if err != nil {
-		return nil, fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text))
+		// Mechanically repairable defects (raw control characters inside
+		// strings, trailing commas) are fixed locally before the caller
+		// spends a re-ask on them. The original error is kept: it is
+		// the one that names what the agent actually got wrong.
+		if fixed := repairStructuredText(text); fixed != text {
+			if repairedOutput, repairErr := parseStructuredTextOutput(fixed, schema); repairErr == nil {
+				output, err, repaired = repairedOutput, nil, true
+			}
+		}
+	}
+	if err != nil {
+		return nil, &StructuredOutputError{Agent: agentName, Text: text, Err: err}
 	}
 
-	return &Result{Output: output, Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
+	return &Result{Output: output, Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported, StructuredOutputRepaired: repaired}, nil
 }
 
 // outputSnippet returns a trimmed, length-capped excerpt of agent output for

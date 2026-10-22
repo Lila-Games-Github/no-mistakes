@@ -108,6 +108,14 @@ type AgentInvocation struct {
 	// FindingCount is the number of findings in this invocation's structured
 	// output. Nil when the output is not findings-shaped.
 	FindingCount *int
+	// StructuredOutputReasks counts the corrective re-asks this row represents
+	// after a structured-output parse/validation failure: 1 on the re-ask
+	// attempt itself, 0 on an attempt that needed none. Nil when the
+	// invocation requested no structured output.
+	StructuredOutputReasks *int
+	// StructuredOutputRepaired is 1 when the output only parsed after local
+	// mechanical repair, else 0. Nil when no structured output was requested.
+	StructuredOutputRepaired *int
 }
 
 // agentInvocationColumns is the canonical column order shared by insert and
@@ -120,7 +128,8 @@ const agentInvocationColumns = `id, run_id, step_name, round, purpose, agent, mo
 	delta_input_tokens, delta_output_tokens, delta_cache_read_tokens,
 	model_roundtrips, tool_calls,
 	tool_wait_calls, tool_test_lint_calls, tool_edit_calls, tool_read_calls, tool_git_calls, tool_other_calls,
-	workload_files, workload_lines, finding_count`
+	workload_files, workload_lines, finding_count,
+	schema_reasks, schema_repaired`
 
 // agentInvocationInsertPlaceholders has one '?' per agentInvocationColumns entry.
 const agentInvocationInsertPlaceholders = `?, ?, ?, ?, ?, ?, ?, ?,
@@ -131,7 +140,8 @@ const agentInvocationInsertPlaceholders = `?, ?, ?, ?, ?, ?, ?, ?,
 	?, ?, ?,
 	?, ?,
 	?, ?, ?, ?, ?, ?,
-	?, ?, ?`
+	?, ?, ?,
+	?, ?`
 
 // InsertAgentInvocation records one completed agent invocation. Nil pointer
 // fields are stored as SQL NULL (database/sql dereferences non-nil pointers).
@@ -149,6 +159,7 @@ func (d *DB) InsertAgentInvocation(inv AgentInvocation) (*AgentInvocation, error
 		inv.ModelRoundtrips, inv.ToolCalls,
 		inv.ToolWaitCalls, inv.ToolTestLintCalls, inv.ToolEditCalls, inv.ToolReadCalls, inv.ToolGitCalls, inv.ToolOtherCalls,
 		inv.WorkloadFiles, inv.WorkloadLines, inv.FindingCount,
+		inv.StructuredOutputReasks, inv.StructuredOutputRepaired,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert agent invocation: %w", err)
@@ -194,6 +205,7 @@ func scanAgentInvocation(row scanner) (AgentInvocation, error) {
 		&inv.ModelRoundtrips, &inv.ToolCalls,
 		&inv.ToolWaitCalls, &inv.ToolTestLintCalls, &inv.ToolEditCalls, &inv.ToolReadCalls, &inv.ToolGitCalls, &inv.ToolOtherCalls,
 		&inv.WorkloadFiles, &inv.WorkloadLines, &inv.FindingCount,
+		&inv.StructuredOutputReasks, &inv.StructuredOutputRepaired,
 	); err != nil {
 		return AgentInvocation{}, fmt.Errorf("scan agent invocation: %w", err)
 	}

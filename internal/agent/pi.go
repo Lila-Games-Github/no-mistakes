@@ -53,8 +53,10 @@ func (a *piAgent) NeutralizesGateInstructions() bool {
 }
 
 func (a *piAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
-	return runWithRetry(ctx, "pi", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
-		return a.runOnce(ctx, opts)
+	return runWithStructuredOutputReask(ctx, "pi", opts, func(opts RunOpts) (*Result, error) {
+		return runWithRetry(ctx, "pi", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
+			return a.runOnce(ctx, opts)
+		})
 	})
 }
 
@@ -160,6 +162,7 @@ func (a *piAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) {
 			res.SessionUsageCumulative = false
 		}
 	}
+	err = withStructuredOutputSession(err, opts, pp.sessionID)
 	emitAgentExited(opts, "pi", pid, err)
 	return res, err
 }

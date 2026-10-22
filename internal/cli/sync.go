@@ -72,7 +72,9 @@ func newAxiSyncCmd() *cobra.Command {
 			"verified pipeline head with reset semantics.\n" +
 			"--check performs the same fresh read-only plan. Blocked states change nothing.\n" +
 			"--recover performs the guarded custody return offered by\n" +
-			"next_action.code: recover_custody; --keep-local keeps the current local head.",
+			"next_action.code: recover_custody; --keep-local keeps the current local head\n" +
+			"(offered as next_action.code: recover_custody_keep_local when the run's\n" +
+			"preserved head diverged and cannot be adopted).",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -277,6 +279,12 @@ func humanSyncSummary(state branchsync.State) string {
 		if state.Safety == "blocked_pipeline_owned_recoverable" {
 			return "run ended without publishing its pipeline commits; recover custody with `no-mistakes sync --recover` (or `no-mistakes rerun` to resume validation)"
 		}
+		if state.Safety == "blocked_pipeline_owned_diverged" {
+			return "run ended without publishing its pipeline commits, which diverged from this branch; keep the current head with `no-mistakes sync --recover --keep-local` (the commits stay anchored) or `no-mistakes rerun` to resume validation"
+		}
+		if state.Safety == "blocked_pipeline_owned_dirty" {
+			return "run ended without publishing its pipeline commits; commit or stash, then recover custody with `no-mistakes sync --recover` (or keep the current head with `--keep-local`)"
+		}
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
 		return "custody returned; the branch is yours - start a fresh run when ready"
@@ -347,7 +355,7 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 	if state.NextAction != nil {
 		help = append(help, "Run `"+state.NextAction.Command+"`")
 	}
-	if state.Safety == "blocked_pipeline_owned_recoverable" {
+	if state.Safety == "blocked_pipeline_owned_recoverable" || state.Safety == "blocked_pipeline_owned_diverged" {
 		help = append(help, "Run `no-mistakes rerun` instead to resume validating the preserved pipeline head")
 	}
 	if len(help) > 0 {
