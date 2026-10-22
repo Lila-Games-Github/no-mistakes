@@ -29,6 +29,7 @@ type fakeSessionAgent struct {
 	failResumes  map[string]error // session id -> error returned when resumed
 	failNext     error            // error returned on the next call regardless
 	supportsFlag bool
+	peakContext  []int // PeakContextTokens reported per call, in order
 }
 
 func newFakeSessionAgent() *fakeSessionAgent {
@@ -57,17 +58,21 @@ func (f *fakeSessionAgent) Run(_ context.Context, opts agent.RunOpts) (*agent.Re
 		return nil, err
 	}
 
+	peak := 0
+	if n := len(f.calls) - 1; n < len(f.peakContext) {
+		peak = f.peakContext[n]
+	}
 	if opts.Session == nil {
-		return &agent.Result{Text: "cold"}, nil
+		return &agent.Result{Text: "cold", PeakContextTokens: peak}, nil
 	}
 	if opts.Session.ID != "" {
 		if err := f.failResumes[opts.Session.ID]; err != nil {
 			return nil, err
 		}
-		return &agent.Result{Text: "resumed", SessionID: opts.Session.ID, Resumed: true}, nil
+		return &agent.Result{Text: "resumed", SessionID: opts.Session.ID, Resumed: true, PeakContextTokens: peak}, nil
 	}
 	f.nextID++
-	return &agent.Result{Text: "started", SessionID: fmt.Sprintf("sess-%d", f.nextID)}, nil
+	return &agent.Result{Text: "started", SessionID: fmt.Sprintf("sess-%d", f.nextID), PeakContextTokens: peak}, nil
 }
 
 func sessionTestDB(t *testing.T) (*db.DB, *db.Run) {
@@ -385,5 +390,60 @@ func TestRunSessions_AgentChangeDiscardsStoredSession(t *testing.T) {
 	}
 	if call := fake.calls[0]; call.session == nil || call.session.ID != "" {
 		t.Fatalf("stored session for another agent must be discarded, got %+v", call.session)
+	}
+}
+
+// TestRunSessions_ContextBudgetRetiresAnOversizedSession proves the lean_turns
+// bound: once a turn's largest model call carried more context than the
+// budget, the next turn of that role starts a fresh session (the prompt still
+// carries the round history), and the persisted identity is dropped so a
+// daemon restart cannot resume the oversized session either.
+func TestRunSessions_ContextBudgetRetiresAnOversizedSession(t *testing.T) {
+	d, run := sessionTestDB(t)
+	fake := newFakeSessionAgent()
+	fake.peakContext = []int{90, 150, 40, 60}
+	rs := NewRunSessions(d, run.ID, fake, true)
+	rs.SetContextBudget(100)
+
+	var notes []string
+	for i := 0; i < 4; i++ {
+		if _, err := rs.Run(context.Background(), fake, SessionRoleFixer, agent.RunOpts{Prompt: fmt.Sprintf("fix round %d", i+1)}, func(s string) { notes = append(notes, s) }); err != nil {
+			t.Fatalf("round %d: %v", i+1, err)
+		}
+	}
+	got := []string{}
+	for _, call := range fake.calls {
+		got = append(got, call.session.ID)
+	}
+	if want := []string{"", "sess-1", "", "sess-2"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("session ids per turn = %v, want %v", got, want)
+	}
+	if len(notes) != 1 {
+		t.Fatalf("notes = %v, want one retirement note", notes)
+	}
+	stored, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].SessionID != "sess-2" {
+		t.Fatalf("persisted sessions = %+v, want only sess-2", stored)
+	}
+}
+
+func TestRunSessions_ZeroContextBudgetNeverRetires(t *testing.T) {
+	d, run := sessionTestDB(t)
+	fake := newFakeSessionAgent()
+	fake.peakContext = []int{1 << 30, 1 << 30, 1 << 30}
+	rs := NewRunSessions(d, run.ID, fake, true)
+
+	for i := 0; i < 3; i++ {
+		if _, err := rs.Run(context.Background(), fake, SessionRoleFixer, agent.RunOpts{Prompt: "fix"}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, call := range fake.calls[1:] {
+		if call.session.ID != "sess-1" {
+			t.Fatalf("turn %d = %+v, want sess-1 reused without a budget", i+2, call.session)
+		}
 	}
 }

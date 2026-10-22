@@ -274,6 +274,7 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, evidenceRoot stri
 			DisableProjectSettings: cfg.DisableProjectSettings,
 			Profile:                cfg.AgentProfileFor(name),
 			Environment:            environment,
+			SkipSkillCatalog:       cfg.LeanTurnsFor(name).SkipSkillCatalog,
 		})
 		if err != nil {
 			for _, existing := range created {
@@ -1163,6 +1164,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 				DisableProjectSettings: cfg.DisableProjectSettings,
 				Profile:                cfg.AgentProfileFor(name),
 				Environment:            forgeEnvironment(forgeCtx),
+				SkipSkillCatalog:       cfg.LeanTurnsFor(name).SkipSkillCatalog,
 			})
 			if agErr != nil {
 				m.db.UpdateRunError(run.ID, fmt.Sprintf("create agent %s: %s", name, agErr))

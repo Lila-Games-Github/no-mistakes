@@ -155,6 +155,8 @@ type GlobalConfig struct {
 	// record replay provenance), never a repository policy. Keeping it out of
 	// RepoConfig means no pushed branch can enable, disable, or resize it.
 	Eval Eval
+	// LeanTurns is global-only for the same reason (see LeanTurns).
+	LeanTurns LeanTurns
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -183,6 +185,7 @@ type globalConfigRaw struct {
 	Intent                  IntentRaw                  `yaml:"intent"`
 	Test                    TestRaw                    `yaml:"test"`
 	Eval                    EvalRaw                    `yaml:"eval"`
+	LeanTurns               LeanTurnsRaw               `yaml:"lean_turns"`
 	ForgeProfiles           ForgeProfiles              `yaml:"forge_profiles"`
 }
 
@@ -277,6 +280,13 @@ type ReviewRaw struct {
 	// the full change exceeds this many added plus deleted lines. Zero keeps
 	// the existing single-turn review, pending finding-recall evidence.
 	ChunkThresholdLines int `yaml:"chunk_threshold_lines"`
+	// ChunkMaxLines caps the added plus deleted lines one chunked review turn
+	// covers. Zero keeps the byte-only budget.
+	ChunkMaxLines int `yaml:"chunk_max_lines"`
+	// ChunkMaxBytes overrides the per-turn patch-byte budget. Zero keeps the
+	// size-dependent default (128 KiB per turn for patches up to 1 MiB,
+	// 256 KiB above).
+	ChunkMaxBytes int `yaml:"chunk_max_bytes"`
 }
 
 // PRRaw is the YAML representation of pull-request settings.
@@ -503,6 +513,7 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	LeanTurns             LeanTurns
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
@@ -543,6 +554,8 @@ type Document struct {
 type Review struct {
 	PathInstructions    []PathInstruction
 	ChunkThresholdLines int
+	ChunkMaxLines       int
+	ChunkMaxBytes       int
 }
 
 // TestRaw is the YAML representation of test-step settings.
@@ -789,6 +802,19 @@ branch_sync_remote_timeout: "60s"
 # its fixes. Supported for claude, codex, grok, and pi; other agents run cold.
 # Set false to force every agent invocation cold.
 session_reuse: true
+
+# Turn-economy measures for slow harnesses, applied only to the listed agents
+# (every other agent is unchanged): a cached repository run-book in review and
+# fix prompts, a delta-first re-review after each fix round (a full-scope
+# review still runs before the step completes), a context bound on the durable
+# fixer session, and launching pi without its skills catalog.
+# lean_turns:
+#   agents: [pi]
+#   runbook: true
+#   runbook_max_bytes: 6000
+#   incremental_rereview: true
+#   fixer_session_max_context_tokens: 200000
+#   skip_skill_catalog: true
 
 # Log level for daemon output
 # Options: debug, info, warn, error
@@ -1574,6 +1600,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
+		LeanTurns:               leanTurnsDefaults(),
 	}
 }
 
@@ -1743,6 +1770,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if err := validateEvalRaw(raw.Eval); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	if err := validateLeanTurnsRaw(raw.LeanTurns); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -1856,6 +1886,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
+	applyLeanTurnsOverrides(&cfg.LeanTurns, &raw.LeanTurns)
 
 	return cfg, nil
 }
@@ -2008,6 +2039,13 @@ func validatePRRaw(pr PRRaw) error {
 	return nil
 }
 
+// Lower bounds for the chunked-review budget: below them a large change would
+// fan out into dozens of turns, each paying the fixed per-turn cost again.
+const (
+	MinReviewChunkMaxLines = 100
+	MinReviewChunkMaxBytes = 16 * 1024
+)
+
 // validateReviewRaw fails the config closed on a review.path_instructions list
 // the review step could not honor deterministically: a missing path or
 // instructions value, a glob the matcher cannot compile, or a list that would
@@ -2024,6 +2062,12 @@ func validatePRRaw(pr PRRaw) error {
 func validateReviewRaw(review ReviewRaw) error {
 	if review.ChunkThresholdLines < 0 || (review.ChunkThresholdLines > 0 && review.ChunkThresholdLines <= 500) {
 		return fmt.Errorf("review.chunk_threshold_lines must be 0 (disabled) or greater than 500")
+	}
+	if review.ChunkMaxLines < 0 || (review.ChunkMaxLines > 0 && review.ChunkMaxLines < MinReviewChunkMaxLines) {
+		return fmt.Errorf("review.chunk_max_lines must be 0 (byte budget only) or at least %d", MinReviewChunkMaxLines)
+	}
+	if review.ChunkMaxBytes < 0 || (review.ChunkMaxBytes > 0 && review.ChunkMaxBytes < MinReviewChunkMaxBytes) {
+		return fmt.Errorf("review.chunk_max_bytes must be 0 (default budget) or at least %d", MinReviewChunkMaxBytes)
 	}
 	if len(review.PathInstructions) > MaxReviewPathInstructions {
 		return fmt.Errorf("review.path_instructions has %d entries, at most %d are allowed", len(review.PathInstructions), MaxReviewPathInstructions)
@@ -2507,6 +2551,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
+		LeanTurns:      global.LeanTurns,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,
@@ -2515,7 +2560,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Intent:         intent,
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
-		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines},
+		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines, ChunkMaxLines: repo.Review.ChunkMaxLines, ChunkMaxBytes: repo.Review.ChunkMaxBytes},
 		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
 		ForgeProfiles:  global.ForgeProfiles,
 		// repo is the EffectiveRepoConfig result, so this value is already

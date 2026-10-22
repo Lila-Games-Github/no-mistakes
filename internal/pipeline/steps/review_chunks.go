@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -22,6 +23,14 @@ const (
 	reviewChunkMaxPaths        = 96
 )
 
+// reviewChunkBudget bounds one chunked review turn. Zero fields keep the
+// defaults: the size-dependent byte budget above and no line limit. The
+// trusted review.chunk_max_bytes / review.chunk_max_lines settings fill them.
+type reviewChunkBudget struct {
+	maxBytes int
+	maxLines int
+}
+
 type reviewPatchPart struct {
 	path       string
 	text       string
@@ -32,6 +41,7 @@ type reviewPatchPart struct {
 type reviewChunk struct {
 	parts []reviewPatchPart
 	bytes int
+	lines int
 }
 
 func reviewPatch(ctx context.Context, workDir, diffRange string) (string, error) {
@@ -63,7 +73,7 @@ func changedLinesInPatch(patch string) int {
 // a mismatch aborts rather than assigning a patch to the wrong file. Boundaries
 // at a newline are preferred, but an exceptionally long line is split at a
 // UTF-8 boundary and its byte interval is labeled in the prompt.
-func planReviewChunks(patch string, changed []string) ([]reviewChunk, error) {
+func planReviewChunks(patch string, changed []string, budget reviewChunkBudget) ([]reviewChunk, error) {
 	if len(changed) == 0 || !strings.HasPrefix(patch, "diff --git ") {
 		return nil, fmt.Errorf("chunked review requires a complete nonempty git patch")
 	}
@@ -74,6 +84,10 @@ func planReviewChunks(patch string, changed []string) ([]reviewChunk, error) {
 	if len(patch) <= 1024*1024 {
 		chunkBytes = reviewChunkSmallPatchBytes
 	}
+	if budget.maxBytes > 0 {
+		chunkBytes = budget.maxBytes
+	}
+	maxLines := budget.maxLines
 	var starts []int
 	starts = append(starts, 0)
 	for pos := 0; ; {
@@ -104,6 +118,8 @@ func planReviewChunks(patch string, changed []string) ([]reviewChunk, error) {
 		if filePatch == "" {
 			return nil, fmt.Errorf("chunked review found an empty patch for changed path %q", path)
 		}
+		changedBefore := changedLineOffsets(filePatch)
+		changedIn := func(start, end int) int { return changedBefore(end) - changedBefore(start) }
 		for offset := 0; offset < len(filePatch); {
 			partEnd := len(filePatch)
 			if partEnd-offset > chunkBytes {
@@ -119,12 +135,17 @@ func planReviewChunks(patch string, changed []string) ([]reviewChunk, error) {
 					}
 				}
 			}
+			if maxLines > 0 && changedIn(offset, partEnd) > maxLines {
+				partEnd = lineBudgetEnd(filePatch, offset, partEnd, maxLines, changedIn)
+			}
 			part := reviewPatchPart{path: path, text: filePatch[offset:partEnd], start: offset, end: partEnd, fileSize: len(filePatch)}
-			if current.bytes+len(part.text) > chunkBytes || len(current.parts) >= reviewChunkMaxPaths || offset > 0 {
+			partLines := changedIn(offset, partEnd)
+			if current.bytes+len(part.text) > chunkBytes || len(current.parts) >= reviewChunkMaxPaths || offset > 0 || (maxLines > 0 && current.lines+partLines > maxLines) {
 				flush()
 			}
 			current.parts = append(current.parts, part)
 			current.bytes += len(part.text)
+			current.lines += partLines
 			if partEnd < len(filePatch) {
 				flush()
 			}
@@ -133,6 +154,60 @@ func planReviewChunks(patch string, changed []string) ([]reviewChunk, error) {
 	}
 	flush()
 	return chunks, nil
+}
+
+// changedLineOffsets returns a function reporting how many changed (added or
+// deleted) lines of one file's patch start before a byte offset, with the
+// same hunk tracking changedLinesInPatch uses, so a continuation part that
+// begins mid-hunk is still counted correctly.
+func changedLineOffsets(filePatch string) func(offset int) int {
+	var ends []int
+	var counts []int
+	count := 0
+	inHunk := false
+	for pos := 0; pos < len(filePatch); {
+		end := strings.IndexByte(filePatch[pos:], '\n')
+		if end < 0 {
+			end = len(filePatch)
+		} else {
+			end += pos + 1
+		}
+		line := filePatch[pos:end]
+		switch {
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case inHunk && (strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-")):
+			count++
+		}
+		ends = append(ends, end)
+		counts = append(counts, count)
+		pos = end
+	}
+	return func(offset int) int {
+		// Lines that end at or before offset are fully counted; a line split
+		// by a byte boundary counts toward the part holding its end.
+		i := sort.SearchInts(ends, offset+1)
+		if i == 0 {
+			return 0
+		}
+		return counts[i-1]
+	}
+}
+
+// lineBudgetEnd moves a part's end back to the line boundary where it
+// reaches maxLines changed lines, always making progress.
+func lineBudgetEnd(filePatch string, offset, partEnd, maxLines int, changedIn func(start, end int) int) int {
+	for pos := offset; pos < partEnd; {
+		next := strings.IndexByte(filePatch[pos:partEnd], '\n')
+		if next < 0 {
+			return partEnd
+		}
+		pos += next + 1
+		if changedIn(offset, pos) >= maxLines {
+			return pos
+		}
+	}
+	return partEnd
 }
 
 func (chunk reviewChunk) paths() []string {
@@ -179,7 +254,7 @@ func (chunk reviewChunk) workload() *agent.InvocationWorkload {
 }
 
 func runChunkedReview(ctx context.Context, sctx *pipeline.StepContext, basePrompt, diffRange string, changed []string, patch string) (Findings, error) {
-	chunks, err := planReviewChunks(patch, changed)
+	chunks, err := planReviewChunks(patch, changed, reviewChunkBudget{maxBytes: sctx.Config.Review.ChunkMaxBytes, maxLines: sctx.Config.Review.ChunkMaxLines})
 	if err != nil {
 		return Findings{}, err
 	}

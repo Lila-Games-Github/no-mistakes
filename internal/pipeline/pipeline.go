@@ -39,7 +39,11 @@ type StepContext struct {
 	// prompt and the PR step's publisher - names the same directory. Empty only
 	// in embeddings that never gather evidence.
 	EvidenceDir string
-	Env         []string // extra environment variables for subprocesses (used in tests)
+	// RunbookDir is where this repository's cached run-books live
+	// (<NM_HOME>/runbooks/<repoID>), never inside the repository. Empty
+	// disables persistence; the run-book is then rebuilt per turn.
+	RunbookDir string
+	Env        []string // extra environment variables for subprocesses (used in tests)
 	// UserIntent is a short, possibly-empty summary of what the change author
 	// was trying to accomplish. It's surfaced in step prompts so agents have
 	// context beyond the diff. Its authority depends on IntentSource: an

@@ -82,11 +82,17 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	// test and lint fix prompts already carry. The instruction is a contract,
 	// not an enforced sandbox - the agent has free shell access - so the pinned
 	// regression tests guard the wording, not the runtime.
+	// lean_turns (global-only, default pi only): a cached repository run-book
+	// in every review and fix prompt, and a delta-scoped re-review after a fix
+	// round. Both are empty/off for every agent the operator did not list.
+	lean := leanTurnsFor(sctx)
+	runbookSection := runbookPromptSection(sctx, lean, baseSHA)
+
 	var fixSummary string
 	if sctx.Fixing && !sctx.SkipFixExecution {
 		startReviewTimeout()
 		previousFindings := sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
-		historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + testguidance.Rule
+		historySection := executionContextPromptSection() + runbookSection + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + testguidance.Rule
 		fixPrompt := fmt.Sprintf(
 			`Investigate previous review findings and address legitimate ones.
 
@@ -204,7 +210,7 @@ Previous review findings to address:
 	// net-deleted-author-lines git-diff backstop for the removal-of-required
 	// class - a fixer round that net-deletes author-added lines parks
 	// regardless of intent source. Held pending a scope decision.
-	historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
+	historySection := executionContextPromptSection() + runbookSection + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
 
 	// Path-scoped repository review guidance, taken from the trusted
 	// default-branch config copy (regardless of allow_repo_commands) so a pushed
@@ -218,8 +224,9 @@ Previous review findings to address:
 	logPathInstructions(sctx.Log, pathInstructionMatches)
 	pathInstructions := reviewPathInstructionsSection(pathInstructionMatches)
 
-	basePrompt := fmt.Sprintf(
-		`Review the code changes and return structured findings with a risk assessment.
+	buildReviewPrompt := func(scope, scopeClause string) string {
+		return fmt.Sprintf(
+			`Review the code changes and return structured findings with a risk assessment.
 
 Context:
 - branch: %s
@@ -267,15 +274,17 @@ Risk assessment (after listing all findings):
 - Set risk_level to "high" if the change should not be merged without explicit human approval - it is fundamental, risky, ambiguous, or has strong negative signals.
 - Provide a one-sentence risk_rationale explaining why you chose that risk level.
 - Set risk_scope to "source-or-external" when the assessment reflects source risk or enforceable external state, and to "pipeline-owned-delivery" only when it is based solely on a deferred outcome this run owns.%s%s`,
-		branch,
-		baseSHA,
-		sctx.Run.HeadSHA,
-		reviewScope,
-		targetBranch,
-		ignorePatterns,
-		historySection,
-		"",
-	)
+			branch,
+			baseSHA,
+			sctx.Run.HeadSHA,
+			scope,
+			targetBranch,
+			ignorePatterns,
+			historySection,
+			scopeClause,
+		)
+	}
+	basePrompt := buildReviewPrompt(reviewScope, "")
 	prompt := basePrompt + pathInstructions
 
 	// Every review turn - the initial review and every post-fix rereview -
@@ -289,43 +298,69 @@ Risk assessment (after listing all findings):
 	// cross-round context a rereview legitimately needs travels in the
 	// explicit sanitized round-history section above; only the fixer keeps a
 	// durable session (executeFixMode), because it certifies nothing.
+	singleTurn := func(turnPrompt, purpose string) (Findings, error) {
+		var turnFindings Findings
+		result, runErr := sctx.RunAgentContext(ctx, agent.RunOpts{
+			Prompt:     turnPrompt,
+			CWD:        sctx.WorkDir,
+			Env:        sctx.Env,
+			JSONSchema: reviewFindingsSchema,
+			OnChunk:    sctx.LogChunk,
+			Purpose:    purpose,
+			Workload:   workload,
+		})
+		if runErr != nil {
+			return Findings{}, reviewAgentError(ctx, timeout, "agent review", runErr)
+		}
+		// Keep the existing text fallback for the unchunked review. A chunked
+		// review instead fails closed if any turn has no structured findings.
+		if result.Output != nil {
+			if err := json.Unmarshal(result.Output, &turnFindings); err != nil {
+				sctx.Log("could not parse structured output, using text response")
+				turnFindings = Findings{Summary: result.Text}
+			}
+		}
+		return stripDeliveryFindings(sctx, turnFindings), nil
+	}
+
+	// Incremental re-review (lean_turns): after a fix round, first review only
+	// the fix-round delta plus the findings that prompted it. The previous
+	// round already reviewed everything up to its starting head, so redoing the
+	// whole branch diff after a small fix is the dominant repeated cost on slow
+	// harnesses. A delta pass can only ever park the round; it never completes
+	// the step. When it finds nothing blocking, the full-scope review below
+	// still runs, so the review that lets this step complete has always seen
+	// the entire change.
+	if deltaBase, deltaPaths, ok := incrementalRereviewDelta(sctx, lean, chunked); ok {
+		sctx.Log(fmt.Sprintf("incremental re-review: reviewing the fix-round delta since %s (%d path(s))", shortSHA(deltaBase), len(deltaPaths)))
+		deltaFindings, err := singleTurn(buildReviewPrompt(fmt.Sprintf("fix-round delta: current worktree and HEAD changes relative to %s", deltaBase), incrementalRereviewClause(baseSHA, deltaBase, deltaPaths))+pathInstructions, "review-delta")
+		if err != nil {
+			return nil, err
+		}
+		if hasBlockingFindings(deltaFindings.Items) {
+			findingsJSON, _ := json.Marshal(deltaFindings)
+			return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
+				NeedsApproval: true,
+				AutoFixable:   len(deltaFindings.Items) > 0,
+				Findings:      string(findingsJSON),
+				FixSummary:    fixSummary,
+			})
+		}
+		sctx.Log("incremental re-review found nothing blocking; running the full-scope review before the step can complete")
+	}
+
 	var findings Findings
 	if chunked {
 		findings, err = runChunkedReview(ctx, sctx, basePrompt, diffRange, changed, patch)
 		if err != nil {
 			return nil, reviewAgentError(ctx, timeout, "agent review", err)
 		}
-	}
-	if !chunked {
-		result, runErr := sctx.RunAgentContext(ctx, agent.RunOpts{
-			Prompt:     prompt,
-			CWD:        sctx.WorkDir,
-			Env:        sctx.Env,
-			JSONSchema: reviewFindingsSchema,
-			OnChunk:    sctx.LogChunk,
-			Purpose:    "review",
-			Workload:   workload,
-		})
-		if runErr != nil {
-			return nil, reviewAgentError(ctx, timeout, "agent review", runErr)
+		findings = stripDeliveryFindings(sctx, findings)
+	} else {
+		findings, err = singleTurn(prompt, "review")
+		if err != nil {
+			return nil, err
 		}
-		// Keep the existing text fallback for the unchunked review. A chunked
-		// review instead fails closed if any turn has no structured findings.
-		if result.Output != nil {
-			if err := json.Unmarshal(result.Output, &findings); err != nil {
-				sctx.Log("could not parse structured output, using text response")
-				findings = Findings{Summary: result.Text}
-			}
-		}
-	}
-
-	// Phase ownership boundary: drop findings that only claim later pipeline-
-	// owned delivery (push/PR/CI for this run) has not happened yet. Prompt
-	// guidance alone is not enough - models still emit these under
-	// authoritative intent criteria like "Open PR A unmerged".
-	if stripped, n := stripDeferredPipelineOwnedDeliveryFindings(findings); n > 0 {
-		sctx.Log(fmt.Sprintf("dropped %d deferred pipeline-owned delivery finding(s) (owned by later push/PR/CI steps)", n))
-		findings = stripped
 	}
 
 	needsApproval := hasBlockingFindings(findings.Items)
@@ -337,6 +372,18 @@ Risk assessment (after listing all findings):
 		Findings:      string(findingsJSON),
 		FixSummary:    fixSummary,
 	})
+}
+
+// stripDeliveryFindings enforces the phase ownership boundary: drop findings
+// that only claim later pipeline-owned delivery (push/PR/CI for this run) has
+// not happened yet. Prompt guidance alone is not enough - models still emit
+// these under authoritative intent criteria like "Open PR A unmerged".
+func stripDeliveryFindings(sctx *pipeline.StepContext, findings Findings) Findings {
+	if stripped, n := stripDeferredPipelineOwnedDeliveryFindings(findings); n > 0 {
+		sctx.Log(fmt.Sprintf("dropped %d deferred pipeline-owned delivery finding(s) (owned by later push/PR/CI steps)", n))
+		return stripped
+	}
+	return findings
 }
 
 // fixRoundProvenanceClause reframes a rereview's fix-round changes as

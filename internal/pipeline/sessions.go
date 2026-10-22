@@ -44,8 +44,37 @@ type RunSessions struct {
 	agent   agent.Agent
 	enabled bool
 
+	// maxContextTokens retires a role's session after a turn whose largest
+	// model call carried more context than this (lean_turns). 0 never retires.
+	maxContextTokens int
+
 	mu  sync.Mutex
 	ids map[SessionRole]agent.SessionRef
+}
+
+// SetContextBudget bounds session growth: after a turn whose largest model
+// call carried more than tokens of context, the role's next turn starts a
+// fresh session. Every review-fix prompt already carries the sanitized round
+// history (findings, decisions, fix summaries), so a fresh session loses only
+// the raw transcript - which on a measured pi run had grown to ~479k tokens
+// per call and was resent on every one of its 226 model calls. Adapters that
+// do not report per-call context (PeakContextTokens == 0) are never retired.
+func (rs *RunSessions) SetContextBudget(tokens int) {
+	if rs != nil {
+		rs.maxContextTokens = tokens
+	}
+}
+
+// retireIfOversized drops the role's session when the finished turn exceeded
+// the context budget.
+func (rs *RunSessions) retireIfOversized(role SessionRole, result *agent.Result, logf func(string)) {
+	if rs.maxContextTokens <= 0 || result == nil || result.PeakContextTokens <= rs.maxContextTokens {
+		return
+	}
+	rs.forget(role)
+	if logf != nil {
+		logf(fmt.Sprintf("%s session reached %d context tokens (budget %d); the next turn starts a fresh session carrying the round history", role, result.PeakContextTokens, rs.maxContextTokens))
+	}
 }
 
 // NewRunSessions creates the manager for one run, loading any persisted
@@ -89,6 +118,7 @@ func (rs *RunSessions) Run(ctx context.Context, a agent.Agent, role SessionRole,
 	result, err := a.Run(ctx, opts)
 	if err == nil {
 		rs.remember(role, result.SessionID, sessionProvider(a, result))
+		rs.retireIfOversized(role, result, logf)
 		return result, nil
 	}
 	if storedID == "" || ctx.Err() != nil {
@@ -109,6 +139,7 @@ func (rs *RunSessions) Run(ctx context.Context, a agent.Agent, role SessionRole,
 		return nil, err
 	}
 	rs.remember(role, result.SessionID, sessionProvider(a, result))
+	rs.retireIfOversized(role, result, logf)
 	return result, nil
 }
 

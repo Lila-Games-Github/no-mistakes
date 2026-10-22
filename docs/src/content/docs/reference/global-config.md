@@ -54,6 +54,14 @@ log_level: info
 
 session_reuse: true
 
+lean_turns:
+  agents: [pi]
+  runbook: true
+  runbook_max_bytes: 6000
+  incremental_rereview: true
+  fixer_session_max_context_tokens: 200000
+  skip_skill_catalog: true
+
 worktree_roots:
   /Users/you/src/my-repo: /Users/you/work/my-repo-runs
 
@@ -487,6 +495,31 @@ When resume is unavailable or fails, the fix turn falls back to a cold run or a 
 Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts; Pi's own session directory retains its native transcript. Keep Pi's session directory private, and keep any `--session-dir` or `PI_CODING_AGENT_SESSION_DIR` setting stable while a run is active so a daemon restart can find the fixer session.
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
 Set `false` to force every agent invocation cold.
+
+### lean_turns
+
+Turn-economy measures for harnesses that otherwise re-explore the repository and re-review the whole change on every turn. They apply only to the agents listed in `lean_turns.agents`; every other agent keeps its exact previous behavior. With an ordered `agent` fallback list, the first agent decides.
+
+|      |          |
+| ---- | -------- |
+| Type | `object` |
+
+| Field                                         | Type     | Default | Description |
+| --------------------------------------------- | -------- | ------- | ----------- |
+| `lean_turns.agents`                           | `list`   | `[pi]`  | Agents the measures apply to; `[]` turns them all off |
+| `lean_turns.runbook`                          | `bool`   | `true`  | Add the cached repository run-book to review, review-fix, test, document, and lint agent prompts |
+| `lean_turns.runbook_max_bytes`                | `int`    | `6000`  | Cap on the injected run-book; `0` is uncapped |
+| `lean_turns.incremental_rereview`             | `bool`   | `true`  | Start each post-fix re-review with a pass over the fix-round delta |
+| `lean_turns.fixer_session_max_context_tokens` | `int`    | `200000` | Retire the durable fixer session after a call carried more context than this; `0` never retires it |
+| `lean_turns.skip_skill_catalog`               | `bool`   | `true`  | Launch Pi with `--no-skills` unless `agent_args_override` already decides skills (`--skill`, `--no-skills`, `-ns`) |
+
+The **run-book** is a compact description of the repository - directory map, the build, test, and lint entry points its root manifests and `commands.*` declare, which toolchain binaries are on the daemon's `PATH`, and an index of `AGENTS.md`/`CLAUDE.md` sections - so agents stop rediscovering those with shell calls each turn. It is read from the trusted default-branch commit the run's trusted config came from, never from the pushed branch, and it omits the instruction-file index when the repository sets [`disable_project_settings`](/no-mistakes/reference/repo-config/#disable_project_settings). The section also asks the agent to batch independent tool calls into one response and to read files once rather than in slices, because on slow harnesses the number of model calls, not tool time, dominates a turn. It is cached under `<NM_HOME>/runbooks/<repo-id>/`, keyed by a hash of its inputs (layout, manifest and instruction-file contents, the toolchain probe, and these settings), so it is rebuilt only when one of them changes. Nothing is written to the repository.
+
+**Incremental re-review** narrows only the first pass after a fix round: that pass reviews the changes since the round's starting head - the head the previous round reviewed - plus the previous findings. A blocking finding there parks the round as usual. When it finds nothing blocking, the ordinary full-scope review runs in the same round, so the step never completes automatically on a delta pass. The one way a delta round completes the step is a human approving its parked findings; every changed line has then still been reviewed, by the initial full review plus the delta passes since. An empty or unreadable delta, a chunked review, and every initial review go straight to the full-scope review. Both passes share the round's [`review_agent_timeout`](#review_agent_timeout).
+
+**Fixer session bound**: when [`session_reuse`](#session_reuse) is on, a fix turn whose largest model call carried more than `fixer_session_max_context_tokens` of context retires its session, and the next fix round starts fresh. The review-fix prompt already carries the sanitized round history, so only the raw transcript is dropped. Adapters that do not report per-call context (currently every adapter except Pi) are never retired.
+
+The settings are global-only: an incremental re-review narrows what a re-review reads, so a `lean_turns` block in a repository's `.no-mistakes.yaml` is ignored. To compare a candidate with and without these measures, use [`eval run --lean-turns`](/no-mistakes/reference/eval/#replay-a-candidate).
 
 ### worktree_roots
 
