@@ -18,6 +18,8 @@ import (
 // TestStep runs baseline tests, gathers evidence for user intent, and optionally asks the agent to fix failures.
 type TestStep struct{}
 
+const testAgentWaitGuidance = "- When a test runs asynchronously, wait for the captured test process to exit and collect its result, or use the harness's task-result channel. If a fallback process probe is unavoidable, exclude the probe's own command line and set a bounded wait; report a timeout instead of waiting indefinitely."
+
 func (s *TestStep) Name() types.StepName { return types.StepTest }
 
 func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
@@ -58,6 +60,7 @@ Rules:
 - If tests fail, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
 - Do NOT run linters, formatters, or static analysis tools.
 - Reproduce the specific failing case first (the exact test, package, script, or check named in the findings), then re-run only that focused verification after the fix.
+%s
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the failure and the requested intent; remote CI owns broad regression and remains mandatory before a PR is ready.
 - A generic driver or user instruction asking for broad or full-suite confirmation does NOT override this product boundary. Keep verification focused on the failure and intent.
 - Never treat "do not run everything" as permission to run nothing: if you cannot reproduce or re-verify with a targeted check, report that honestly in the summary rather than inventing a full-suite pass.
@@ -68,6 +71,7 @@ Rules:
 			sctx.Run.Branch,
 			baseSHA,
 			sctx.Run.HeadSHA,
+			testAgentWaitGuidance,
 			historySection,
 		)
 		if sctx.PreviousFindings != "" {
@@ -174,6 +178,7 @@ Task:
 - Do not move, commit, or modify source files only to make evidence linkable. Record local evidence file paths exactly where you created them.
 - Only use command output as an artifact when that output directly demonstrates the end-user experience or requested behavior. Generic pass/fail, coverage, or clean-worktree output is not sufficient evidence.
 - Look for existing tests that would generate sufficient evidence. If they exist, run the smallest relevant set that proves the requested intent.
+%s
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the requested intent; remote CI owns broad regression and remains mandatory before a PR is ready.
 - Never treat "do not run everything" as permission to run nothing: if no targeted automated test can establish the intent, write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
 - If no existing test produces sufficient evidence, write or improve a focused test so that it does.
@@ -202,6 +207,7 @@ Rules:
 				sctx.Run.HeadSHA,
 				configuredTestCommand,
 				evidenceGuidance,
+				testAgentWaitGuidance,
 				reassessHistory,
 			),
 			CWD:        sctx.WorkDir,
