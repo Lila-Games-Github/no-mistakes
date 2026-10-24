@@ -145,6 +145,18 @@ The earlier `agent+model` candidate spelling was replaced by the key=value form 
 
 The command streams one scored progress line per replay as it completes, then renders the session's score summary in the same dashboard style as `eval sets` and `stats`, followed by the session identifier. Re-running the same `eval run` is additive by design - each invocation records a fresh measurement session - but it is safe: identical inputs land in the same cohort so the report aggregates the samples instead of fragmenting into a new comparison group, while captured labels and manifests remain unchanged.
 
+### Resume failed repeats
+
+A provider can fail one repeat of a multi-hour replay, and a replay that simply re-plans every case and every repeat from the start spends hours re-measuring the samples that already completed. `--resume <session-id>` retries only what is missing:
+
+```sh
+no-mistakes eval run --resume 1792475048829853883-eeb7f3e20383dd9e
+```
+
+The session id is the one the original `eval run` printed on its last line. A resume replans exactly the `(case, repeat)` slots whose latest recorded attempt is missing or failed, and it takes no `--cases`, `--candidate`, `--repeats`, `--case`, or review-context override: the recorded session already fixes the case set, repeat count, cohort, candidate identity, and isolated overrides, and combining it with any of those flags is refused rather than silently ignored, so a retried slot always joins the comparison it was planned for. A resume of a session with nothing missing is a no-op that records nothing, and resuming a session whose slots are still reserved by a replay in flight is refused instead of running its slots twice at once.
+
+Every retry is recorded as its own attempt beside the failed row, which is never overwritten: a first attempt keeps the file name it always had, and a retry is written as `repeat-<n>-attempt-<n>.json` in the same per-case session directory. Reports keep one authoritative row per slot - the highest attempt - so a recovered slot counts once, as its completion, rather than adding both a failure and a sample to the cohort.
+
 ## Report results
 
 ```sh
@@ -157,14 +169,14 @@ The report groups local replays by candidate and cohort. A cohort pins the selec
 - recall over gold issues, or unlabeled / pending when a case has no finding-level gold
 - precision bounds, and F1 only when false-positive gold exists
 - queued unmatched candidate findings, which are not scored as false positives
-- failed candidate invocations
+- failed candidate invocations, counted once per `(case, repeat)` slot from its latest attempt
 - reported fresh-input plus output token cost
 - average wall time
 - a finite-sample case-level recall range, with repeats averaged inside each case
 - whether a candidate lies on the observed recall-versus-token-cost frontier
 
-The report is deliberately cautious. It never treats an unadjudicated candidate finding as a false positive, excludes candidates with failed replays from the frontier, and distinguishes missing token instrumentation from a real zero. It is a pure read: repeated reports over unchanged recorded evaluations produce identical text output.
+The report is deliberately cautious. It never treats an unadjudicated candidate finding as a false positive, excludes candidates with failed replays from the frontier, and distinguishes missing token instrumentation from a real zero. A slot retried through `eval run --resume` is scored as its latest attempt, so the retry restores the sample the session planned; the attempts it replaced stay recorded for audit but do not penalize the candidate a second time. It is a pure read: repeated reports over unchanged recorded evaluations produce identical text output.
 
 ## Current boundary
 
-Finding-level gold is derived from recorded Fix, add-finding, auto-fix-merged, and shipped-unfixed evidence, plus confirmed post-PR misses ingested through `eval miss ingest`. An adjudication CLI, PR-comment miss scanning, sharing, sync, and full-pipeline replay are not part of this command surface. A live merge, `eval relabel`, or recapture backfills merge-derived labels onto already captured cases.
+Finding-level gold is derived from recorded Fix, add-finding, auto-fix-merged, and shipped-unfixed evidence, plus confirmed post-PR misses ingested through `eval miss ingest`. An adjudication CLI, PR-comment miss scanning, sharing, sync, and full-pipeline replay are not part of this command surface. A resume retries slots; it never rewrites a recorded attempt or re-labels a case. A live merge, `eval relabel`, or recapture backfills merge-derived labels onto already captured cases.

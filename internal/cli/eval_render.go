@@ -230,13 +230,19 @@ func evalRunProgress(w io.Writer, evaluation eval.Evaluation, completed, total i
 
 // renderEvalRunSummary renders the finished (or partially finished) replay
 // session in the same dashboard frame as stats and eval sets.
-func renderEvalRunSummary(session eval.Session, evaluations []eval.Evaluation, caseCount int) string {
+func renderEvalRunSummary(session eval.Session, evaluations []eval.Evaluation, plan eval.ReplayPlan) string {
 	s := eval.SummarizeEvaluations(evaluations)
 	var lines []string
 	lines = append(lines, "")
 	lines = append(lines, metricStatsLine("Candidate", "", session.Candidate))
 	lines = append(lines, metricStatsLine("Case set", "", fmt.Sprintf("%s · cohort %s", session.Set, session.Cohort)))
-	lines = append(lines, metricStatsLine("Replays", strconv.Itoa(s.Total), fmt.Sprintf("%d case(s) x %d repeat(s) · %d failure(s)", caseCount, session.Repeats, s.Failures)))
+	// A resume reports what it retried rather than restating the session's
+	// plan as if the whole of it had just run.
+	replayNote := fmt.Sprintf("%d case(s) x %d repeat(s) · %d failure(s)", len(session.CaseIDs), session.Repeats, s.Failures)
+	if plan.Resumed {
+		replayNote = fmt.Sprintf("%d retried slot(s) of %d planned · %d failure(s)", len(plan.Slots), plan.Total, s.Failures)
+	}
+	lines = append(lines, metricStatsLine("Replays", strconv.Itoa(s.Total), replayNote))
 	lines = append(lines, metricStatsLine("Labeled", strconv.Itoa(s.Labeled), "replay(s) of cases with finding-level gold"))
 	lines = append(lines, "")
 	if s.Labeled == 0 {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,6 +36,12 @@ type ReplayOptions struct {
 	Set       string
 	Candidate Candidate
 	Repeats   int
+	// ResumeSessionID replays only the failed or missing slots of an existing
+	// recorded session. Set, Candidate, Repeats, CaseIDs and the isolated
+	// overrides are then read from that session and never from this struct, so
+	// a resumed slot always runs as the candidate and cohort it was planned
+	// for. Each retry is recorded as a new attempt beside the failed row.
+	ResumeSessionID string
 	// CaseIDs narrows the selected set to exact captured cases for paired
 	// experiments. Both variants then retain the same cohort identity.
 	CaseIDs []string
@@ -50,7 +58,7 @@ type ReplayOptions struct {
 	// the captured or default bounds), false lists no agent. Nil preserves the
 	// captured configuration. The override is part of the candidate identity.
 	LeanTurns *bool
-	OnPlan    func(session Session, cases []Case)
+	OnPlan    func(plan ReplayPlan)
 	OnResult  func(evaluation Evaluation, completed, total int)
 }
 
@@ -63,6 +71,39 @@ type Session struct {
 	Repeats   int       `json:"repeats"`
 	CaseIDs   []string  `json:"case_ids"`
 	Cohort    string    `json:"cohort"`
+	// CandidateSpec is the operator's candidate spelling and the three
+	// isolated overrides are its other inputs, recorded so a resume can
+	// re-derive the exact identity this session planned under instead of
+	// trusting a flag (see Session.resumeCandidate). A session recorded before
+	// resume existed leaves them empty.
+	CandidateSpec             string `json:"candidate_spec,omitempty"`
+	ReviewChunkThresholdLines *int   `json:"review_chunk_threshold_lines,omitempty"`
+	ReviewChunkMaxLines       *int   `json:"review_chunk_max_lines,omitempty"`
+	LeanTurns                 *bool  `json:"lean_turns,omitempty"`
+}
+
+// ReplayPlan is the slot-level work one replay batch executes: one entry per
+// (case, repeat) it will invoke the candidate on.
+type ReplayPlan struct {
+	Session Session
+	Slots   []ReplaySlot
+	// Total is how many slots the session plans in full, so a resume can
+	// report how much of it is being retried.
+	Total int
+	// Resumed reports that this plan retries only the failed or missing slots
+	// of an existing session rather than planning every slot from scratch.
+	Resumed bool
+}
+
+// ReplaySlot is one planned unit of replay work. Attempt is the try number the
+// slot is recorded as; a slot is identified in every user-facing surface by
+// its case ID, repeat, and attempt.
+type ReplaySlot struct {
+	CaseID  string
+	Repeat  int
+	Attempt int
+	// caseRecord is the captured case the slot restores.
+	caseRecord Case
 }
 
 const (
@@ -74,9 +115,15 @@ const (
 // use the production NM_HOME: every case is restored into a fresh temp gate and
 // worktree. Push, PR, CI, and all fix loops are intentionally absent from the
 // MVP subject under test.
+//
+// With ReplayOptions.ResumeSessionID it instead replans the failed or missing
+// slots of that recorded session; see resumeReplay.
 func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []Evaluation, error) {
 	if store == nil {
 		return Session{}, nil, fmt.Errorf("eval replay requires a store")
+	}
+	if opts.ResumeSessionID != "" {
+		return store.resumeReplay(ctx, opts)
 	}
 	if opts.Repeats <= 0 {
 		return Session{}, nil, fmt.Errorf("repeats must be at least 1")
@@ -96,37 +143,247 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	}
 	replayCtx, cancelReplay := context.WithCancel(ctx)
 	stopReservation := store.keepReplayReservation(replayCtx, cancelReplay, session.ID)
+
+	plan := ReplayPlan{Session: session, Total: len(cases) * opts.Repeats}
+	// Repeat-major, matching the order the slots are invoked in.
+	for repeat := 1; repeat <= opts.Repeats; repeat++ {
+		for _, c := range cases {
+			plan.Slots = append(plan.Slots, ReplaySlot{CaseID: c.ID, Repeat: repeat, Attempt: 1, caseRecord: c})
+		}
+	}
+	return store.runReplayPlan(replayCtx, cancelReplay, stopReservation, plan, opts.Candidate, replayOverrides{chunkThreshold: opts.ReviewChunkThresholdLines, chunkMaxLines: opts.ReviewChunkMaxLines, leanTurns: opts.LeanTurns}, opts.OnPlan, opts.OnResult)
+}
+
+// runReplayPlan invokes the candidate on every planned slot under the
+// session's reservation lease and records one evaluation per slot. A failed
+// invocation is recorded, never skipped, and reported at the end. It owns the
+// lease it is handed: the caller must have created a cancellable context that
+// cancels the run when the reservation can no longer be refreshed.
+func (s *Store) runReplayPlan(ctx context.Context, cancelReplay context.CancelFunc, stopReservation func(), plan ReplayPlan, candidate Candidate, overrides replayOverrides, onPlan func(ReplayPlan), onResult func(Evaluation, int, int)) (Session, []Evaluation, error) {
+	session := plan.Session
 	defer func() {
 		cancelReplay()
 		stopReservation()
-		store.releaseReplayReservation(session.ID)
+		s.releaseReplayReservation(session.ID)
 	}()
-
-	if opts.OnPlan != nil {
-		opts.OnPlan(session, cases)
+	if onPlan != nil {
+		onPlan(plan)
 	}
-	total := len(cases) * opts.Repeats
+	total := len(plan.Slots)
 	evaluations := make([]Evaluation, 0, total)
 	var failed int
-	for repeat := 1; repeat <= opts.Repeats; repeat++ {
-		for _, c := range cases {
-			evaluation := replayOne(replayCtx, store, c, session, opts.Candidate, replayOverrides{chunkThreshold: opts.ReviewChunkThresholdLines, chunkMaxLines: opts.ReviewChunkMaxLines, leanTurns: opts.LeanTurns}, repeat)
-			if evaluation.Status != "completed" {
-				failed++
-			}
-			if err := store.persistEvaluation(c, evaluation); err != nil {
-				return session, evaluations, err
-			}
-			evaluations = append(evaluations, evaluation)
-			if opts.OnResult != nil {
-				opts.OnResult(evaluation, len(evaluations), total)
-			}
+	for _, slot := range plan.Slots {
+		evaluation := replayOne(ctx, s, slot, session, candidate, overrides)
+		if evaluation.Status != "completed" {
+			failed++
+		}
+		if err := s.persistEvaluation(slot.caseRecord, evaluation); err != nil {
+			return session, evaluations, err
+		}
+		evaluations = append(evaluations, evaluation)
+		if onResult != nil {
+			onResult(evaluation, len(evaluations), total)
 		}
 	}
 	if failed > 0 {
 		return session, evaluations, fmt.Errorf("%d replay invocation(s) failed; inspect eval report for the local failure count", failed)
 	}
 	return session, evaluations, nil
+}
+
+// resumeReplay replans an existing session's failed or missing slots. The
+// session is the authority for everything that makes the samples comparable -
+// its case set, repeat count, cohort, and candidate identity - so a resume
+// cannot be pointed at a different comparison, and every retry lands beside
+// the failed row as its own attempt instead of overwriting it.
+func (s *Store) resumeReplay(ctx context.Context, opts ReplayOptions) (Session, []Evaluation, error) {
+	plan, candidate, overrides, err := s.resumePlan(ctx, opts.ResumeSessionID)
+	if err != nil {
+		return Session{}, nil, err
+	}
+	replayCtx, cancelReplay := context.WithCancel(ctx)
+	stopReservation := s.keepReplayReservation(replayCtx, cancelReplay, plan.Session.ID)
+	return s.runReplayPlan(replayCtx, cancelReplay, stopReservation, plan, candidate, overrides, opts.OnPlan, opts.OnResult)
+}
+
+// resumePlan selects the slots a resume will retry and reserves the session's
+// cases. It holds the corpus lock only for that planning window, never for the
+// replay itself, so a multi-hour retry cannot block a capture or a prune.
+func (s *Store) resumePlan(ctx context.Context, sessionID string) (ReplayPlan, Candidate, replayOverrides, error) {
+	unlock, err := lockCorpus(ctx, s.root)
+	if err != nil {
+		return ReplayPlan{}, Candidate{}, replayOverrides{}, err
+	}
+	defer unlock()
+
+	session, err := s.loadSession(sessionID)
+	if err != nil {
+		return ReplayPlan{}, Candidate{}, replayOverrides{}, err
+	}
+	candidate, overrides, err := session.resumeCandidate()
+	if err != nil {
+		return ReplayPlan{}, Candidate{}, replayOverrides{}, err
+	}
+	cases, err := s.sessionCases(session)
+	if err != nil {
+		return ReplayPlan{}, Candidate{}, replayOverrides{}, err
+	}
+	plan := ReplayPlan{Session: session, Total: len(cases) * session.Repeats, Resumed: true}
+	for repeat := 1; repeat <= session.Repeats; repeat++ {
+		for _, c := range cases {
+			attempt, status, err := s.latestSlotAttempt(session, c, repeat)
+			if err != nil {
+				return ReplayPlan{}, Candidate{}, replayOverrides{}, err
+			}
+			if status == "completed" {
+				continue
+			}
+			plan.Slots = append(plan.Slots, ReplaySlot{CaseID: c.ID, Repeat: repeat, Attempt: attempt + 1, caseRecord: c})
+		}
+	}
+	if err := s.reserveSessionCases(ctx, session, cases); err != nil {
+		return ReplayPlan{}, Candidate{}, replayOverrides{}, err
+	}
+	return plan, candidate, overrides, nil
+}
+
+// loadSession reads one recorded session. The id is a file name this tool
+// generated, so anything else is refused rather than resolved.
+func (s *Store) loadSession(id string) (Session, error) {
+	sessionsDir := filepath.Join(s.root, "sessions")
+	if strings.TrimSpace(id) == "" || filepath.Base(id) != id || id == "." || id == ".." {
+		return Session{}, fmt.Errorf("eval session %q is not a recorded session id", id)
+	}
+	var session Session
+	path := filepath.Join(sessionsDir, id+".json")
+	if err := readJSON(path, &session); err != nil {
+		if os.IsNotExist(err) {
+			return Session{}, fmt.Errorf("eval session %q is not recorded under %s", id, sessionsDir)
+		}
+		return Session{}, fmt.Errorf("read eval session %q: %w", id, err)
+	}
+	if session.Repeats <= 0 || len(session.CaseIDs) == 0 {
+		return Session{}, fmt.Errorf("eval session %q records no replay plan", id)
+	}
+	return session, nil
+}
+
+// resumeCandidate reproduces the candidate identity the session was planned
+// with, from the inputs it recorded. The identity is never re-specified by the
+// operator: it is re-derived and must match the recorded spelling exactly, so a
+// resumed slot can never be attributed to a candidate its cohort never
+// compared. A session this build cannot reproduce - one recorded before the
+// inputs were persisted, under an agent name that has since been removed - is
+// refused rather than replayed as something else.
+func (s Session) resumeCandidate() (Candidate, replayOverrides, error) {
+	spec := s.CandidateSpec
+	if spec == "" {
+		// Sessions written before the inputs were recorded carry only their
+		// derived identity. It is usable when it parses as a plain candidate,
+		// which is exactly when its identity has no isolated override.
+		spec = s.Candidate
+	}
+	candidate, err := ParseCandidate(spec)
+	if err != nil {
+		return Candidate{}, replayOverrides{}, fmt.Errorf("eval session %s cannot reproduce candidate %q: %w; rerun the case set instead of resuming it", s.ID, s.Candidate, err)
+	}
+	overrides := replayOverrides{chunkThreshold: s.ReviewChunkThresholdLines, chunkMaxLines: s.ReviewChunkMaxLines, leanTurns: s.LeanTurns}
+	if derived := candidateIdentity(candidate, overrides); derived != s.Candidate {
+		return Candidate{}, replayOverrides{}, fmt.Errorf("eval session %s cannot reproduce candidate %q (its recorded inputs derive %q); rerun the case set instead of resuming it", s.ID, s.Candidate, derived)
+	}
+	return candidate, overrides, nil
+}
+
+// sessionCases resolves the recorded case IDs to their captured records,
+// independently of the case set they were selected from: the session's own
+// case list is the comparison it was planned for, and a case that has since
+// left its set (a relabel, a diversified re-pin) still belongs to it.
+func (s *Store) sessionCases(session Session) ([]Case, error) {
+	all, err := s.ListCases("all")
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]Case, len(all))
+	for _, c := range all {
+		byID[c.ID] = c
+	}
+	cases := make([]Case, 0, len(session.CaseIDs))
+	for _, id := range session.CaseIDs {
+		c, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("eval session %s planned case %s, which is no longer in the local corpus", session.ID, id)
+		}
+		cases = append(cases, c)
+	}
+	return cases, nil
+}
+
+// latestSlotAttempt reports the highest attempt recorded for one slot and its
+// status. No row means the slot was never replayed.
+func (s *Store) latestSlotAttempt(session Session, c Case, repeat int) (int, string, error) {
+	var attempt int
+	var status string
+	err := s.db.QueryRow(`SELECT attempt, status FROM evaluations WHERE session_id = ? AND case_id = ? AND candidate = ? AND repeat_number = ? ORDER BY attempt DESC LIMIT 1`,
+		session.ID, c.ID, session.Candidate, repeat).Scan(&attempt, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("read recorded eval slot: %w", err)
+	}
+	return attempt, status, nil
+}
+
+// reserveSessionCases re-reserves a resumed session's cases for as long as the
+// retry runs, so a corpus prune cannot reclaim a case mid-replay (see
+// Store.Prune). A reservation still held by a live replay means the same
+// session is being replayed right now, which a second resume would duplicate.
+func (s *Store) reserveSessionCases(ctx context.Context, session Session, cases []Case) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin eval replay reservation: %w", err)
+	}
+	var live int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM replay_case_reservations WHERE session_id = ? AND reserved_until > ?`, session.ID, time.Now().Unix()).Scan(&live); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("inspect eval replay reservations: %w", err)
+	}
+	if live > 0 {
+		_ = tx.Rollback()
+		return fmt.Errorf("eval session %s is still reserved by a replay in flight; wait for it to finish before resuming it", session.ID)
+	}
+	reservedUntil := time.Now().Add(replayReservationLease).Unix()
+	for _, c := range cases {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO replay_case_reservations (session_id, case_id, reserved_until) VALUES (?, ?, ?)`, session.ID, c.ID, reservedUntil); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("reserve eval case %q: %w", c.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit eval replay reservation: %w", err)
+	}
+	return nil
+}
+
+// candidateIdentity is the recorded identity of one candidate: its spelling
+// plus the isolated overrides that take part in it. Two variants of the same
+// agent never collapse into one reported group.
+func candidateIdentity(candidate Candidate, overrides replayOverrides) string {
+	name := candidate.String()
+	if overrides.chunkThreshold != nil {
+		name = fmt.Sprintf("%s,review_chunk_threshold_lines=%d", name, *overrides.chunkThreshold)
+	}
+	if overrides.chunkMaxLines != nil {
+		name = fmt.Sprintf("%s,review_chunk_max_lines=%d", name, *overrides.chunkMaxLines)
+	}
+	if overrides.leanTurns != nil {
+		state := "off"
+		if *overrides.leanTurns {
+			state = "on"
+		}
+		name = fmt.Sprintf("%s,lean_turns=%s", name, state)
+	}
+	return name
 }
 
 func (s *Store) prepareReplay(ctx context.Context, opts ReplayOptions) ([]Case, Session, error) {
@@ -160,21 +417,19 @@ func (s *Store) prepareReplay(ctx context.Context, opts ReplayOptions) ([]Case, 
 	if len(cases) == 0 {
 		return nil, Session{}, fmt.Errorf("case set %q is empty", opts.Set)
 	}
-	candidateName := opts.Candidate.String()
-	if opts.ReviewChunkThresholdLines != nil {
-		candidateName = fmt.Sprintf("%s,review_chunk_threshold_lines=%d", candidateName, *opts.ReviewChunkThresholdLines)
+	session := Session{
+		ID:        newSessionID(),
+		StartedAt: time.Now().UTC(),
+		Set:       opts.Set,
+		Candidate: candidateIdentity(opts.Candidate, replayOverrides{chunkThreshold: opts.ReviewChunkThresholdLines, chunkMaxLines: opts.ReviewChunkMaxLines, leanTurns: opts.LeanTurns}),
+		// The inputs are recorded beside the identity they derive, so a
+		// resume reproduces it instead of trusting a flag (resumeCandidate).
+		CandidateSpec:             opts.Candidate.String(),
+		Repeats:                   opts.Repeats,
+		ReviewChunkThresholdLines: opts.ReviewChunkThresholdLines,
+		ReviewChunkMaxLines:       opts.ReviewChunkMaxLines,
+		LeanTurns:                 opts.LeanTurns,
 	}
-	if opts.ReviewChunkMaxLines != nil {
-		candidateName = fmt.Sprintf("%s,review_chunk_max_lines=%d", candidateName, *opts.ReviewChunkMaxLines)
-	}
-	if opts.LeanTurns != nil {
-		state := "off"
-		if *opts.LeanTurns {
-			state = "on"
-		}
-		candidateName = fmt.Sprintf("%s,lean_turns=%s", candidateName, state)
-	}
-	session := Session{ID: newSessionID(), StartedAt: time.Now().UTC(), Set: opts.Set, Candidate: candidateName, Repeats: opts.Repeats}
 	for _, c := range cases {
 		session.CaseIDs = append(session.CaseIDs, c.ID)
 	}
@@ -246,7 +501,8 @@ type replayOverrides struct {
 	leanTurns      *bool
 }
 
-func replayOne(ctx context.Context, store *Store, c Case, session Session, candidate Candidate, overrides replayOverrides, repeat int) (evaluation Evaluation) {
+func replayOne(ctx context.Context, store *Store, slot ReplaySlot, session Session, candidate Candidate, overrides replayOverrides) (evaluation Evaluation) {
+	c := slot.caseRecord
 	started := time.Now()
 	evaluation = Evaluation{
 		ID:        newSessionID(),
@@ -254,7 +510,8 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		CaseID:    c.ID,
 		Candidate: session.Candidate,
 		Cohort:    session.Cohort,
-		Repeat:    repeat,
+		Repeat:    slot.Repeat,
+		Attempt:   slot.Attempt,
 		StartedAt: started.Unix(),
 		Status:    "failed",
 	}
@@ -666,7 +923,8 @@ func (s *Store) persistEvaluation(c Case, evaluation Evaluation) error {
 	if err := os.MkdirAll(resultDir, 0o755); err != nil {
 		return fmt.Errorf("create eval result directory: %w", err)
 	}
-	path := filepath.Join(resultDir, fmt.Sprintf("repeat-%03d.json", evaluation.Repeat))
+	// A retry is a new attempt and never overwrites the row it retries.
+	path := filepath.Join(resultDir, attemptFileName(evaluation.Repeat, evaluation.Attempt))
 	if err := writeJSON(path, evaluation); err != nil {
 		return fmt.Errorf("write eval result: %w", err)
 	}
@@ -675,9 +933,9 @@ func (s *Store) persistEvaluation(c Case, evaluation Evaluation) error {
 		reported = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO evaluations
-(id, session_id, case_id, candidate, repeat_number, started_at, completed_at, status, gold_count, true_positive, false_negative, false_positive, pending, tokens_reported, input_tokens, output_tokens, fresh_input_tokens, duration_ms, path)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		evaluation.ID, evaluation.SessionID, evaluation.CaseID, evaluation.Candidate, evaluation.Repeat,
+(id, session_id, case_id, candidate, repeat_number, attempt, started_at, completed_at, status, gold_count, true_positive, false_negative, false_positive, pending, tokens_reported, input_tokens, output_tokens, fresh_input_tokens, duration_ms, path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		evaluation.ID, evaluation.SessionID, evaluation.CaseID, evaluation.Candidate, evaluation.Repeat, evaluation.Attempt,
 		evaluation.StartedAt, evaluation.CompletedAt, evaluation.Status, evaluation.GoldCount,
 		evaluation.TruePositive, evaluation.FalseNegative, evaluation.FalsePositive, evaluation.Pending, reported,
 		evaluation.InputTokens, evaluation.OutputTokens, evaluation.FreshInputTokens, evaluation.DurationMS, path)
@@ -685,6 +943,16 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		return fmt.Errorf("record eval result: %w", err)
 	}
 	return nil
+}
+
+// attemptFileName is the file name one attempt is persisted under inside its
+// case's session directory. The first attempt keeps the name a session has
+// always used; a retry names its attempt beside it.
+func attemptFileName(repeat, attempt int) string {
+	if attempt <= 1 {
+		return fmt.Sprintf("repeat-%03d.json", repeat)
+	}
+	return fmt.Sprintf("repeat-%03d-attempt-%02d.json", repeat, attempt)
 }
 
 func candidatePathPart(candidate string) string {

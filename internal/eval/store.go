@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
     candidate TEXT NOT NULL,
     repeat_number INTEGER NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
     started_at INTEGER NOT NULL,
     completed_at INTEGER NOT NULL,
     status TEXT NOT NULL,
@@ -125,8 +126,31 @@ CREATE TABLE IF NOT EXISTS diversified_pins (
 			return fmt.Errorf("migrate eval replay reservations: %w", err)
 		}
 	}
+	// Every row recorded before replay resume existed is that slot's first
+	// attempt, which is exactly the column default.
+	var attemptColumn int
+	if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('evaluations') WHERE name = 'attempt'`).Scan(&attemptColumn); err != nil {
+		return fmt.Errorf("inspect eval result schema: %w", err)
+	}
+	if attemptColumn == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE evaluations ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("migrate eval results: %w", err)
+		}
+	}
 	return nil
 }
+
+// latestAttemptFilter keeps exactly one row per replay slot: the highest
+// attempt recorded for a (session, case, candidate, repeat). Resume records a
+// retried slot as a new attempt and never overwrites the failed row, so
+// without this rule one slot would be counted twice - once as its failure and
+// once as its recovery - and a recovered candidate could never leave the
+// failure bucket or restore the sample the replay was planned for. Attempts
+// are unique per slot, so completed_at never has to break a tie. It refers to
+// the outer query's row as e.
+const latestAttemptFilter = `NOT EXISTS (SELECT 1 FROM evaluations o
+	WHERE o.session_id = e.session_id AND o.case_id = e.case_id AND o.candidate = e.candidate
+	  AND o.repeat_number = e.repeat_number AND o.attempt > e.attempt)`
 
 func (s *Store) dropParkPassSchema() error {
 	var parkColumn int
@@ -438,7 +462,7 @@ func (s *Store) pendingFindingCounts() (map[string]int, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("eval registry is closed")
 	}
-	rows, err := s.db.Query(`SELECT case_id, COALESCE(SUM(pending), 0) FROM evaluations WHERE status = 'completed' GROUP BY case_id`)
+	rows, err := s.db.Query(`SELECT case_id, COALESCE(SUM(pending), 0) FROM evaluations e WHERE status = 'completed' AND ` + latestAttemptFilter + ` GROUP BY case_id`)
 	if err != nil {
 		return nil, fmt.Errorf("sum queued candidate findings: %w", err)
 	}
