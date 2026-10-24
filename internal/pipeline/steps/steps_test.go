@@ -24,6 +24,22 @@ func TestMain(m *testing.M) {
 	// via GIT_CONFIG_COUNT/KEY_n/VALUE_n; tests that need it re-set it with
 	// t.Setenv (issue #362).
 	os.Unsetenv("GIT_CONFIG_COUNT")
+	// t.TempDir uses TMPDIR. When that directory is inside this checkout,
+	// Git commands in a fixture without its own .git must stop there rather
+	// than discover (and potentially reset) the implementation checkout.
+	tempRoot, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "resolve test temp root:", err)
+		os.Exit(1)
+	}
+	ceiling := tempRoot
+	if existing := os.Getenv("GIT_CEILING_DIRECTORIES"); existing != "" {
+		ceiling += string(os.PathListSeparator) + existing
+	}
+	if err := os.Setenv("GIT_CEILING_DIRECTORIES", ceiling); err != nil {
+		fmt.Fprintln(os.Stderr, "set Git discovery ceiling:", err)
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 

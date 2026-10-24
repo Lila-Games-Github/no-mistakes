@@ -17,6 +17,10 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 
+# Keep pre-init Git commands in a worktree-local test fixture from walking
+# upward into the implementation checkout.
+export GIT_CEILING_DIRECTORIES="$ROOT${GIT_CEILING_DIRECTORIES:+:$GIT_CEILING_DIRECTORIES}"
+
 if [[ -z "${NM_E2E_DAEMON_INVENTORY:-}" ]]; then
   base="/tmp"
   if [[ -d /private/tmp ]]; then
