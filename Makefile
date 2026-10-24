@@ -49,7 +49,7 @@ install: build
 	$(INSTALL_BIN) daemon start
 
 test:
-	go test -race ./...
+	GIT_CEILING_DIRECTORIES="$(CURDIR)$${GIT_CEILING_DIRECTORIES:+:$$GIT_CEILING_DIRECTORIES}" go test -race ./...
 
 # End-to-end suite: drives the real no-mistakes binary against a fake
 # agent through the full push -> pipeline -> push journey for each
