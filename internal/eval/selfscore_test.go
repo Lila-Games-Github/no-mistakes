@@ -93,9 +93,9 @@ func TestReplayReportsPlanAndPerResultProgress(t *testing.T) {
 		Repeats:                   2,
 		CaseIDs:                   []string{captured[0].ID},
 		ReviewChunkThresholdLines: &chunkOff,
-		OnPlan: func(session Session, cases []Case) {
-			plannedCases = len(cases)
-			plannedCohort = session.Cohort
+		OnPlan: func(plan ReplayPlan) {
+			plannedCases = len(plan.Session.CaseIDs)
+			plannedCohort = plan.Session.Cohort
 		},
 		OnResult: func(evaluation Evaluation, completed, total int) {
 			results = append(results, progress{completed, total})
