@@ -270,12 +270,18 @@ type Case struct {
 // Confusion-matrix fields are finding-level: unmatched candidate findings stay
 // in Pending and are never treated as false positives.
 type Evaluation struct {
-	ID                string `json:"id"`
-	SessionID         string `json:"session_id"`
-	CaseID            string `json:"case_id"`
-	Candidate         string `json:"candidate"`
-	Cohort            string `json:"cohort"`
-	Repeat            int    `json:"repeat"`
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	CaseID    string `json:"case_id"`
+	Candidate string `json:"candidate"`
+	Cohort    string `json:"cohort"`
+	Repeat    int    `json:"repeat"`
+	// Attempt is which try at this (session, case, repeat) slot this row
+	// records. A fresh replay plans attempt 1; a resumed one records its
+	// retries as attempt 2, 3, ... beside the failed row it never overwrites.
+	// Reports keep the highest attempt as the slot's authoritative outcome
+	// (see latestAttemptFilter), so a recovered slot counts once.
+	Attempt           int    `json:"attempt"`
 	StartedAt         int64  `json:"started_at"`
 	CompletedAt       int64  `json:"completed_at"`
 	Status            string `json:"status"`

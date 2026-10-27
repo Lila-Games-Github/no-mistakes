@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -248,6 +249,156 @@ func TestEvalRunRendersProgressAndScoreDashboard(t *testing.T) {
 	if !strings.Contains(report, "replays: 4") {
 		t.Fatalf("report = %q, want all four replays counted in the single cohort", report)
 	}
+}
+
+// `eval run --resume` retries only the slots of a recorded session that are
+// missing or failed, without the operator re-stating a case set, candidate, or
+// repeat count: the session those retries belong to is the authority for all
+// of them.
+func TestEvalRunResumeRetriesOnlyTheFailedSlots(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	t.Setenv("NM_HOME", root)
+	chdir(t, t.TempDir())
+
+	findings := `{"findings":[{"id":"real-bug","severity":"error","file":"main.go","line":3,"description":"bug","action":"ask-user","review_scope":"source"}],"risk_level":"high","risk_rationale":"bug","risk_scope":"source-or-external"}`
+	fixture := setupEvalCLIFixture(t, ctx, root, findings)
+	selected := `["real-bug"]`
+	if err := fixture.db.SetStepRoundSelection(fixture.round.ID, &selected, db.RoundSelectionSourceUser); err != nil {
+		t.Fatal(err)
+	}
+	// The first repeat fails the way a provider does: exit 1 with no output.
+	installFlakyCLIReviewAgent(t, root, findings, 1)
+	if out, err := executeCmd("eval", "capture", fixture.run.ID); err != nil {
+		t.Fatalf("eval capture: %v\n%s", err, out)
+	}
+
+	out, err := executeCmd("eval", "run", "--cases", "labeled", "--candidate", "claude,model=test", "--repeats", "2")
+	if err == nil || !strings.Contains(err.Error(), "1 replay invocation(s) failed") {
+		t.Fatalf("first pass = %v\n%s", err, out)
+	}
+	session := sessionFromRunOutput(t, out)
+
+	out, err = executeCmd("eval", "run", "--resume", session)
+	if err != nil {
+		t.Fatalf("eval run --resume: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "resuming session "+session+": 1 of 2 planned slot(s) missing or failed, with claude,model=test on labeled") {
+		t.Fatalf("resume output = %q, want the retried slot named against the recorded plan", out)
+	}
+	if !strings.Contains(out, "1 retried slot(s) of 2 planned") {
+		t.Fatalf("resume output = %q, want the summary to describe the retry, not a fresh plan", out)
+	}
+	if !strings.Contains(out, "local eval session "+session) {
+		t.Fatalf("resume output = %q, want the session line to name the recorded session", out)
+	}
+
+	// Retrying again has nothing left to do, and says so.
+	out, err = executeCmd("eval", "run", "--resume", session)
+	if err != nil {
+		t.Fatalf("second resume: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "session "+session+" has no failed or missing slot out of 2 planned; nothing to resume") {
+		t.Fatalf("second resume output = %q, want an explicit no-op", out)
+	}
+
+	// The recovered slot is counted once, as a completion.
+	report, err := executeCmd("eval", "report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(report, "replays: 2") || !strings.Contains(report, "failures: 0") {
+		t.Fatalf("report = %q, want the recovered slot counted once and out of the failure bucket", report)
+	}
+}
+
+// A resume must not be combinable with a flag that would retry the slots into
+// a comparison the recorded session never planned.
+func TestEvalRunResumeRefusesFlagsThatWouldChangeTheRecordedComparison(t *testing.T) {
+	t.Setenv("NM_HOME", t.TempDir())
+	chdir(t, t.TempDir())
+	for _, args := range [][]string{
+		{"eval", "run", "--resume", "some-session", "--cases", "labeled"},
+		{"eval", "run", "--resume", "some-session", "--candidate", "claude,model=test"},
+		{"eval", "run", "--resume", "some-session", "--repeats", "2"},
+		{"eval", "run", "--resume", "some-session", "--case", "abc"},
+		{"eval", "run", "--resume", "some-session", "--review-chunk-threshold-lines", "0"},
+		{"eval", "run", "--resume", "some-session", "--lean-turns", "on"},
+	} {
+		out, err := executeCmd(args...)
+		if err == nil || !strings.Contains(err.Error(), "cannot be combined with --resume") {
+			t.Fatalf("%v = %v\n%s, want the conflicting flag refused", args, err, out)
+		}
+	}
+}
+
+func TestEvalRunNeedsACaseSetCandidateOrARecordedSession(t *testing.T) {
+	t.Setenv("NM_HOME", t.TempDir())
+	chdir(t, t.TempDir())
+
+	if out, err := executeCmd("eval", "run"); err == nil || !strings.Contains(err.Error(), "--cases is required") {
+		t.Fatalf("bare eval run = %v\n%s, want the case set required", err, out)
+	}
+	if out, err := executeCmd("eval", "run", "--cases", "labeled"); err == nil || !strings.Contains(err.Error(), "--candidate is required") {
+		t.Fatalf("eval run without a candidate = %v\n%s, want the candidate required", err, out)
+	}
+	out, err := executeCmd("eval", "run", "--resume", "no-such-session")
+	if err == nil || !strings.Contains(err.Error(), "no-such-session") || !strings.Contains(err.Error(), "not recorded") {
+		t.Fatalf("eval run --resume of an unknown session = %v\n%s, want the missing session named", err, out)
+	}
+}
+
+// sessionFromRunOutput reads the session id the run's trailing line prints.
+func sessionFromRunOutput(t *testing.T, out string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if rest, ok := strings.CutPrefix(line, "local eval session "); ok {
+			id, _, found := strings.Cut(rest, ":")
+			if !found || id == "" {
+				break
+			}
+			return id
+		}
+	}
+	t.Fatalf("run output = %q, want the trailing session line", out)
+	return ""
+}
+
+// installFlakyCLIReviewAgent installs the fake claude review the eval CLI tests
+// drive, except its first failFirst invocations exit 1 with no output, which is
+// how one slot of a session ends up failed.
+func installFlakyCLIReviewAgent(t *testing.T, root, findingsJSON string, failFirst int) {
+	t.Helper()
+	fakeDir := t.TempDir()
+	counter := filepath.Join(fakeDir, "invocations")
+	fake := filepath.Join(fakeDir, "claude")
+	reply := `{"type":"assistant","message":{"usage":{"input_tokens":12,"output_tokens":3},"content":[{"type":"text","text":"review"}]}}
+{"type":"result","subtype":"success","is_error":false,"structured_output":` + findingsJSON + `,"usage":{"input_tokens":12,"output_tokens":3}}
+`
+	var script string
+	if runtime.GOOS == "windows" {
+		fake += ".cmd"
+		script = "@echo off\r\n" +
+			"more >nul\r\n" +
+			"set /a n=0\r\n" +
+			"if exist \"" + counter + "\" for /f %%c in ('type \"" + counter + "\"') do set /a n=%%c\r\n" +
+			"set /a n+=1\r\n" +
+			">\"" + counter + "\" echo %n%\r\n" +
+			fmt.Sprintf("if %%n%% LEQ %d exit /b 1\r\n", failFirst) +
+			"echo " + strings.ReplaceAll(strings.TrimSpace(reply), "\n", "\r\necho ") + "\r\n"
+	} else {
+		script = "#!/bin/sh\n" +
+			"cat >/dev/null\n" +
+			"n=$(cat \"" + counter + "\" 2>/dev/null || echo 0)\n" +
+			"n=$((n + 1))\n" +
+			"printf '%s' \"$n\" > \"" + counter + "\"\n" +
+			fmt.Sprintf("if [ \"$n\" -le %d ]; then exit 1; fi\n", failFirst) +
+			"cat <<'EOF'\n" + reply + "EOF\n"
+	}
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(fake)+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 type evalCLIFixture struct {

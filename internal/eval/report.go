@@ -73,7 +73,10 @@ func (s *Store) evaluations() ([]Evaluation, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("eval registry is closed")
 	}
-	rows, err := s.db.Query(`SELECT path FROM evaluations ORDER BY completed_at, id`)
+	// One row per slot: a slot a resume retried is counted as its latest
+	// attempt, so recovering a failed slot restores the sample the session
+	// planned instead of adding a sixth replay to it.
+	rows, err := s.db.Query(`SELECT path FROM evaluations e WHERE ` + latestAttemptFilter + ` ORDER BY e.completed_at, e.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list eval results: %w", err)
 	}

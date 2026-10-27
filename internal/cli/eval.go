@@ -164,14 +164,41 @@ func newEvalRunCmd() *cobra.Command {
 	var leanTurns string
 	var reviewChunkMaxLines int
 	var caseIDs []string
+	var resumeSession string
 	cmd := &cobra.Command{
-		Use:   "run --cases <all|labeled|diversified|tune> --candidate <agent,model=...[,effort=...]>",
+		Use:   "run --cases <all|labeled|diversified|tune> --candidate <agent,model=...[,effort=...]> [--resume <session-id>]",
 		Short: "Replay captured review passes and score findings against gold",
-		Args:  cobra.NoArgs,
+		Long: "Replays captured review passes through the Review step and scores the findings against gold.\n\n" +
+			"With --resume <session-id>, only the (case, repeat) slots whose latest attempt is missing or failed are replayed. " +
+			"That session's case set, repeat count, candidate identity, and review overrides are its own, so a retried slot joins the comparison it was planned for, " +
+			"and each retry is recorded as a new attempt beside the failed row instead of overwriting it.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			candidate, err := eval.ParseCandidate(candidateRaw)
-			if err != nil {
-				return err
+			if resumeSession != "" {
+				// The recorded session is the authority for the comparison: a
+				// flag that could change the case set, the candidate identity,
+				// the repeat count, or the review context would retry slots into
+				// a group the session never compared.
+				for _, name := range []string{"cases", "candidate", "repeats", "case", "review-chunk-threshold-lines", "review-chunk-max-lines", "lean-turns"} {
+					if cmd.Flags().Changed(name) {
+						return fmt.Errorf("--%s cannot be combined with --resume: session %s already records the case set, candidate identity, repeat count and review overrides", name, resumeSession)
+					}
+				}
+			} else {
+				if cases == "" {
+					return fmt.Errorf("--cases is required unless --resume <session-id> retries a recorded session")
+				}
+				if candidateRaw == "" {
+					return fmt.Errorf("--candidate is required unless --resume <session-id> retries a recorded session")
+				}
+			}
+			var candidate eval.Candidate
+			if candidateRaw != "" {
+				parsed, err := eval.ParseCandidate(candidateRaw)
+				if err != nil {
+					return err
+				}
+				candidate = parsed
 			}
 			_, store, err := openEvalStore()
 			if err != nil {
@@ -179,7 +206,7 @@ func newEvalRunCmd() *cobra.Command {
 			}
 			defer store.Close()
 			out := cmd.OutOrStdout()
-			caseCount := 0
+			var plan eval.ReplayPlan
 			var chunkOverride *int
 			if cmd.Flags().Changed("review-chunk-threshold-lines") {
 				chunkOverride = &reviewChunkThreshold
@@ -205,13 +232,22 @@ func newEvalRunCmd() *cobra.Command {
 				Candidate:                 candidate,
 				Repeats:                   repeats,
 				CaseIDs:                   caseIDs,
+				ResumeSessionID:           resumeSession,
 				ReviewChunkThresholdLines: chunkOverride,
 				ReviewChunkMaxLines:       chunkMaxLinesOverride,
 				LeanTurns:                 leanOverride,
-				OnPlan: func(session eval.Session, planned []eval.Case) {
-					caseCount = len(planned)
-					fmt.Fprintf(out, "replaying %d case(s) x %d repeat(s) with %s on %s (cohort %s)\n\n",
-						len(planned), session.Repeats, session.Candidate, session.Set, session.Cohort)
+				OnPlan: func(p eval.ReplayPlan) {
+					plan = p
+					switch {
+					case p.Resumed && len(p.Slots) == 0:
+						fmt.Fprintf(out, "session %s has no failed or missing slot out of %d planned; nothing to resume\n\n", p.Session.ID, p.Total)
+					case p.Resumed:
+						fmt.Fprintf(out, "resuming session %s: %d of %d planned slot(s) missing or failed, with %s on %s (cohort %s)\n\n",
+							p.Session.ID, len(p.Slots), p.Total, p.Session.Candidate, p.Session.Set, p.Session.Cohort)
+					default:
+						fmt.Fprintf(out, "replaying %d case(s) x %d repeat(s) with %s on %s (cohort %s)\n\n",
+							len(p.Session.CaseIDs), p.Session.Repeats, p.Session.Candidate, p.Session.Set, p.Session.Cohort)
+					}
 				},
 				OnResult: func(evaluation eval.Evaluation, completed, total int) {
 					evalRunProgress(out, evaluation, completed, total)
@@ -219,9 +255,9 @@ func newEvalRunCmd() *cobra.Command {
 			})
 			if len(evaluations) > 0 {
 				fmt.Fprintln(out)
-				fmt.Fprintln(out, renderEvalRunSummary(session, evaluations, caseCount))
+				fmt.Fprintln(out, renderEvalRunSummary(plan.Session, evaluations, plan))
 			}
-			fmt.Fprintf(out, "local eval session %s: %d replay(s), candidate %s, repeats %d\n", session.ID, len(evaluations), candidate, repeats)
+			fmt.Fprintf(out, "local eval session %s: %d replay(s), candidate %s, repeats %d\n", session.ID, len(evaluations), session.Candidate, session.Repeats)
 			if runErr != nil {
 				return runErr
 			}
@@ -235,8 +271,7 @@ func newEvalRunCmd() *cobra.Command {
 	cmd.Flags().IntVar(&reviewChunkMaxLines, "review-chunk-max-lines", 0, "isolated replay override: changed lines per chunked review turn (0 keeps the byte budget only)")
 	cmd.Flags().StringVar(&leanTurns, "lean-turns", "", "isolated replay override: on applies lean_turns to the candidate agent, off disables it")
 	cmd.Flags().StringArrayVar(&caseIDs, "case", nil, "replay only this exact captured case ID (repeatable)")
-	_ = cmd.MarkFlagRequired("cases")
-	_ = cmd.MarkFlagRequired("candidate")
+	cmd.Flags().StringVar(&resumeSession, "resume", "", "retry only the failed or missing case-repeat slots of this recorded eval session id")
 	return cmd
 }
 
