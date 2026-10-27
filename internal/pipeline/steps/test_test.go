@@ -526,6 +526,7 @@ func TestTestStep_FixMode_TargetedVerificationContract(t *testing.T) {
 		"wait for the captured test process to exit and collect its result, or use the harness's task-result channel",
 		"exclude the probe's own command line and set a bounded wait; report a timeout",
 		"re-run only that focused verification after the fix",
+		"Use a targeted fixture for mutation checks instead of a long lane suite",
 		"Do NOT run the complete repository test suite",
 		"Local Test is targeted validation of the failure and the requested intent",
 		"remote CI owns broad regression and remains mandatory before a PR is ready",
