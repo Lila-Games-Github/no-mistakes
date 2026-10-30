@@ -33,6 +33,8 @@ func assertTestQualityRulePrompt(t *testing.T, prompt string) {
 		"development-only evaluation, not live-LLM CI",
 		"reproduce the reported failure when feasible",
 		"fail before the fix and pass after it",
+		"Budget optional probes against the phase's remaining time",
+		"return focused-suite evidence or an explicit finding before the phase deadline",
 	} {
 		if !strings.Contains(normalizedPrompt, want) {
 			t.Errorf("emitted agent prompt missing test-quality guidance %q:\n%s", want, prompt)

@@ -96,6 +96,11 @@ development-only evaluation, not live-LLM CI.
 For a regression, reproduce the reported failure when feasible: the test should
 fail before the fix and pass after it.
 
+Budget optional probes against the phase's remaining time. Stop probing early
+enough to return focused-suite evidence or an explicit finding before the phase
+deadline instead of letting cancellation discard the result. For mutation
+checks, use a targeted fixture rather than a long lane suite.
+
 
 Everything below - preconditions, intent, the validate-and-decide loop - applies
 the same way once the work is committed on a feature branch.
