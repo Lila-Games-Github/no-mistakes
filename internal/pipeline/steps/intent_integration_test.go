@@ -43,12 +43,14 @@ func initIntentRepo(t *testing.T) (repoDir, fakeHome, base, head string) {
 	gitCmd(t, repoDir, "add", ".")
 	gitCmd(t, repoDir, "commit", "-m", "base")
 	base = gitCmd(t, repoDir, "rev-parse", "HEAD")
+	gitCmd(t, repoDir, "checkout", "-b", "fixture-head")
 	if err := os.WriteFile(filepath.Join(repoDir, "internal_foo.go"), []byte("package foo\nfunc Bar() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, repoDir, "add", ".")
 	gitCmd(t, repoDir, "commit", "-m", "head")
 	head = gitCmd(t, repoDir, "rev-parse", "HEAD")
+	fixtureTime := intentFixtureCommitTime(t, repoDir, head)
 
 	fakeHome = t.TempDir()
 	encoded := testClaudeProjectDirName(repoDir)
@@ -56,13 +58,29 @@ func initIntentRepo(t *testing.T) (repoDir, fakeHome, base, head string) {
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	transcript := `{"type":"user","cwd":` + testJSONString(t, repoDir) + `,"timestamp":"2026-04-18T02:15:37.407Z","uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please add Bar() to internal_foo.go"}}
-{"type":"assistant","cwd":` + testJSONString(t, repoDir) + `,"timestamp":"2026-04-18T02:15:38.000Z","uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(repoDir, "internal_foo.go")) + `}}]}}
+	transcript := `{"type":"user","cwd":` + testJSONString(t, repoDir) + `,"timestamp":` + testJSONString(t, fixtureTime.Format(time.RFC3339Nano)) + `,"uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please add Bar() to internal_foo.go"}}
+{"type":"assistant","cwd":` + testJSONString(t, repoDir) + `,"timestamp":` + testJSONString(t, fixtureTime.Format(time.RFC3339Nano)) + `,"uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(repoDir, "internal_foo.go")) + `}}]}}
 `
-	if err := os.WriteFile(filepath.Join(claudeDir, "session.jsonl"), []byte(transcript), 0o644); err != nil {
+	if err := writeIntentTranscriptFixture(filepath.Join(claudeDir, "session.jsonl"), transcript, fixtureTime); err != nil {
 		t.Fatal(err)
 	}
 	return
+}
+
+func intentFixtureCommitTime(t *testing.T, repoDir, sha string) time.Time {
+	t.Helper()
+	commitTime, err := time.Parse(time.RFC3339, gitCmd(t, repoDir, "show", "-s", "--format=%cI", sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return commitTime.UTC()
+}
+
+func writeIntentTranscriptFixture(path, transcript string, activityTime time.Time) error {
+	if err := os.WriteFile(path, []byte(transcript), 0o644); err != nil {
+		return err
+	}
+	return os.Chtimes(path, activityTime, activityTime)
 }
 
 func testClaudeProjectDirName(cwd string) string {
@@ -153,6 +171,49 @@ func TestIntentStep_Integration_AttachesSummaryToRun(t *testing.T) {
 	}
 }
 
+func TestIntentStep_Integration_TranscriptOutsideSlackWindow(t *testing.T) {
+	repoDir, fakeHome, base, head := initIntentRepo(t)
+	withFakeHome(t, fakeHome)
+	transcriptPath := filepath.Join(fakeHome, ".claude", "projects", testClaudeProjectDirName(repoDir), "session.jsonl")
+	transcript, err := os.ReadFile(transcriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstRecord struct {
+		Timestamp time.Time `json:"timestamp"`
+	}
+	if err := json.Unmarshal([]byte(strings.SplitN(string(transcript), "\n", 2)[0]), &firstRecord); err != nil {
+		t.Fatal(err)
+	}
+	baseTime := intentFixtureCommitTime(t, repoDir, base)
+	headTime := intentFixtureCommitTime(t, repoDir, head)
+	const slackDays = 3
+	windowStart := baseTime.Add(-slackDays * 24 * time.Hour)
+	if firstRecord.Timestamp.Before(windowStart) || firstRecord.Timestamp.After(headTime) {
+		t.Fatalf("fixture timestamp %s outside commit window [%s, %s]", firstRecord.Timestamp, windowStart, headTime)
+	}
+
+	// Claude uses file modification time as the session's last activity.
+	// Move both transcript timestamps and that file time beyond the cutoff.
+	outside := windowStart.Add(-time.Second)
+	staleTranscript := strings.ReplaceAll(string(transcript), firstRecord.Timestamp.Format(time.RFC3339Nano), outside.Format(time.RFC3339Nano))
+	if staleTranscript == string(transcript) {
+		t.Fatal("fixture timestamp was not replaced")
+	}
+	if err := writeIntentTranscriptFixture(transcriptPath, staleTranscript, outside); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Intent: config.Intent{Enabled: true, Threshold: 0.1, SlackDays: slackDays}}
+	sctx := newIntentIntegrationContext(t, repoDir, base, head, cfg)
+	outcome, err := (&IntentStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if outcome == nil || !outcome.Skipped {
+		t.Fatalf("expected transcript outside SlackDays to be skipped, got %+v", outcome)
+	}
+}
+
 func TestIntentStep_Integration_DisabledIsNoOp(t *testing.T) {
 	repoDir, fakeHome, base, head := initIntentRepo(t)
 	withFakeHome(t, fakeHome)
@@ -211,6 +272,7 @@ func TestIntentStep_Integration_DeletedFilesDoNotDiluteIntentMatch(t *testing.T)
 	gitCmd(t, repoDir, "add", ".")
 	gitCmd(t, repoDir, "commit", "-m", "base")
 	base := gitCmd(t, repoDir, "rev-parse", "HEAD")
+	gitCmd(t, repoDir, "checkout", "-b", "fixture-head")
 
 	for i := 0; i < 40; i++ {
 		if err := os.Remove(filepath.Join(repoDir, fmt.Sprintf("obsolete_%02d.go", i))); err != nil {
@@ -223,6 +285,7 @@ func TestIntentStep_Integration_DeletedFilesDoNotDiluteIntentMatch(t *testing.T)
 	gitCmd(t, repoDir, "add", ".")
 	gitCmd(t, repoDir, "commit", "-m", "replace obsolete code")
 	head := gitCmd(t, repoDir, "rev-parse", "HEAD")
+	fixtureTime := intentFixtureCommitTime(t, repoDir, head)
 
 	fakeHome := t.TempDir()
 	encoded := testClaudeProjectDirName(repoDir)
@@ -230,10 +293,10 @@ func TestIntentStep_Integration_DeletedFilesDoNotDiluteIntentMatch(t *testing.T)
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	transcript := `{"type":"user","cwd":` + testJSONString(t, repoDir) + `,"timestamp":"2026-04-18T02:15:37.407Z","uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please add Run() to active.go"}}
-{"type":"assistant","cwd":` + testJSONString(t, repoDir) + `,"timestamp":"2026-04-18T02:15:38.000Z","uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(repoDir, "active.go")) + `}}]}}
+	transcript := `{"type":"user","cwd":` + testJSONString(t, repoDir) + `,"timestamp":` + testJSONString(t, fixtureTime.Format(time.RFC3339Nano)) + `,"uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please add Run() to active.go"}}
+{"type":"assistant","cwd":` + testJSONString(t, repoDir) + `,"timestamp":` + testJSONString(t, fixtureTime.Format(time.RFC3339Nano)) + `,"uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(repoDir, "active.go")) + `}}]}}
 `
-	if err := os.WriteFile(filepath.Join(claudeDir, "session.jsonl"), []byte(transcript), 0o644); err != nil {
+	if err := writeIntentTranscriptFixture(filepath.Join(claudeDir, "session.jsonl"), transcript, fixtureTime); err != nil {
 		t.Fatal(err)
 	}
 	withFakeHome(t, fakeHome)
@@ -306,6 +369,7 @@ func TestIntentStep_Integration_UsesPipelineWorkDirForGitState(t *testing.T) {
 	gitCmd(t, originRepo, "add", ".")
 	gitCmd(t, originRepo, "commit", "-m", "base")
 	base := gitCmd(t, originRepo, "rev-parse", "HEAD")
+	fixtureTime := intentFixtureCommitTime(t, originRepo, base)
 
 	fakeHome := t.TempDir()
 	encoded := testClaudeProjectDirName(originRepo)
@@ -313,10 +377,10 @@ func TestIntentStep_Integration_UsesPipelineWorkDirForGitState(t *testing.T) {
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	transcript := `{"type":"user","cwd":` + testJSONString(t, originRepo) + `,"timestamp":"2026-04-18T02:15:37.407Z","uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please add Bar() to internal_foo.go"}}
-{"type":"assistant","cwd":` + testJSONString(t, originRepo) + `,"timestamp":"2026-04-18T02:15:38.000Z","uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(originRepo, "internal_foo.go")) + `}}]}}
+	transcript := `{"type":"user","cwd":` + testJSONString(t, originRepo) + `,"timestamp":` + testJSONString(t, fixtureTime.Format(time.RFC3339Nano)) + `,"uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please add Bar() to internal_foo.go"}}
+{"type":"assistant","cwd":` + testJSONString(t, originRepo) + `,"timestamp":` + testJSONString(t, fixtureTime.Format(time.RFC3339Nano)) + `,"uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(originRepo, "internal_foo.go")) + `}}]}}
 `
-	if err := os.WriteFile(filepath.Join(claudeDir, "session.jsonl"), []byte(transcript), 0o644); err != nil {
+	if err := writeIntentTranscriptFixture(filepath.Join(claudeDir, "session.jsonl"), transcript, fixtureTime); err != nil {
 		t.Fatal(err)
 	}
 	withFakeHome(t, fakeHome)
