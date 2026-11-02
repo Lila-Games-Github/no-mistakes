@@ -72,7 +72,11 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	if opts.Session != nil {
 		resumeID = opts.Session.ID
 	}
-	args := a.buildArgs(opts.JSONSchema, resumeID)
+	commandAgent := *a
+	if opts.Model != "" {
+		commandAgent.extraArgs = append(append([]string(nil), a.extraArgs...), "--model", opts.Model)
+	}
+	args := commandAgent.buildArgs(opts.JSONSchema, resumeID)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
 	// Claude Code print mode documents text stdin as its non-interactive

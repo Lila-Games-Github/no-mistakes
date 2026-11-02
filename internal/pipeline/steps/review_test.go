@@ -51,6 +51,45 @@ func TestReviewStep_HangingAgentFailsRunAfterTimeout(t *testing.T) {
 	}
 }
 
+func TestReviewStep_RereviewModelFollowsPriorRisk(t *testing.T) {
+	for _, tc := range []struct {
+		name, risk, wantModel string
+	}{
+		{name: "low risk", risk: "low", wantModel: "sonnet"},
+		{name: "high risk", risk: "high"},
+		{name: "missing risk"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, baseSHA, headSHA := setupGitRepo(t)
+			gitCmd(t, dir, "checkout", "--detach", headSHA)
+			if err := os.WriteFile(filepath.Join(dir, "review-fix.txt"), []byte("fixed"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitCmd(t, dir, "add", "-N", "review-fix.txt")
+			ag := &mockAgent{name: "claude", runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+				if opts.Model != tc.wantModel {
+					t.Errorf("review model = %q, want %q", opts.Model, tc.wantModel)
+				}
+				if opts.Purpose != "review-delta" {
+					t.Errorf("review purpose = %q, want review-delta", opts.Purpose)
+				}
+				return &agent.Result{Output: json.RawMessage(`{"findings":[],"risk_level":"low"}`)}, nil
+			}}
+			sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+			sctx.ReviewPass = 2
+			sctx.ReviewPreviousHeadSHA = headSHA
+			sctx.ReviewPreviousRisk = tc.risk
+			sctx.Config.Review.LowRiskModel = "sonnet"
+			if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(ag.calls) != 1 {
+				t.Fatalf("review calls = %d, want 1", len(ag.calls))
+			}
+		})
+	}
+}
+
 // TestReviewStep_EachRoundGetsItsOwnAgentBudget pins the documented
 // review_agent_timeout contract: the deadline bounds ONE review round -
 // its optional fix turn plus the rereview turn share a single budget - and
@@ -79,6 +118,9 @@ func TestReviewStep_EachRoundGetsItsOwnAgentBudget(t *testing.T) {
 			isFix := strings.Contains(opts.Prompt, "Investigate previous review findings")
 			calls = append(calls, call{fixTurn: isFix, deadline: dl})
 			if isFix {
+				if err := os.WriteFile(filepath.Join(dir, "budget-fix.txt"), []byte("fixed"), 0o644); err != nil {
+					return nil, err
+				}
 				return &agent.Result{Output: json.RawMessage("fixed it")}, nil
 			}
 			// Round 1 raises an auto-fixable finding; later rounds are clean.

@@ -92,7 +92,11 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 	if opts.Session != nil {
 		resumeID = opts.Session.ID
 	}
-	args := a.buildArgs(schemaPath, resumeID)
+	commandAgent := *a
+	if opts.Model != "" {
+		commandAgent.extraArgs = append(append([]string(nil), a.extraArgs...), "-m", opts.Model)
+	}
+	args := commandAgent.buildArgs(schemaPath, resumeID)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
 	cmd.Stdin = strings.NewReader(opts.Prompt)

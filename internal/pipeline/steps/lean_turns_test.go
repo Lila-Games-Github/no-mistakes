@@ -33,7 +33,9 @@ func leanRereviewContext(t *testing.T, script func(call int, opts agent.RunOpts)
 	sctx.Config.LeanTurns = config.DefaultGlobalConfig().LeanTurns
 	sctx.RunbookDir = filepath.Join(t.TempDir(), "runbooks")
 	sctx.Fixing = true
+	sctx.ReviewPass = 2
 	sctx.ReviewStartingHeadSHA = headSHA
+	sctx.ReviewPreviousHeadSHA = headSHA
 	sctx.PreviousFindings = leanPreviousFindings
 	return sctx, ag, dir
 }
@@ -49,11 +51,11 @@ func fixThenFindings(dir string, perCall map[int]Findings) func(int, agent.RunOp
 	}
 }
 
-func TestReviewStep_LeanRereviewReviewsTheDeltaThenRunsAFullPass(t *testing.T) {
+func TestReviewStep_LeanRereviewOnlyReviewsTheDelta(t *testing.T) {
 	t.Parallel()
 	var dir string
 	sctx, ag, d := leanRereviewContext(t, func(call int, opts agent.RunOpts) (*agent.Result, error) {
-		return fixThenFindings(dir, map[int]Findings{2: {Summary: "delta clean"}, 3: {Summary: "full clean"}})(call, opts)
+		return fixThenFindings(dir, map[int]Findings{2: {Summary: "delta clean"}})(call, opts)
 	})
 	dir = d
 	startHead := sctx.ReviewStartingHeadSHA
@@ -62,32 +64,29 @@ func TestReviewStep_LeanRereviewReviewsTheDeltaThenRunsAFullPass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ag.calls) != 3 {
-		t.Fatalf("calls = %d, want fix + delta review + full review", len(ag.calls))
+	if len(ag.calls) != 2 {
+		t.Fatalf("calls = %d, want fix + delta review only", len(ag.calls))
 	}
-	fix, delta, full := ag.calls[0], ag.calls[1], ag.calls[2]
-	if delta.Purpose != "review-delta" || full.Purpose != "review" {
-		t.Fatalf("purposes = %q, %q", delta.Purpose, full.Purpose)
+	fix, delta := ag.calls[0], ag.calls[1]
+	if delta.Purpose != "review-delta" {
+		t.Fatalf("purpose = %q, want review-delta", delta.Purpose)
 	}
-	for _, want := range []string{"Incremental re-review scope:", "`git diff " + startHead + "`", "review-fix.txt", "A full-scope review of the whole branch still runs"} {
+	for _, want := range []string{"Incremental re-review scope:", "`git diff " + startHead + "`", "review-fix.txt"} {
 		if !strings.Contains(delta.Prompt, want) {
 			t.Errorf("delta prompt missing %q:\n%s", want, delta.Prompt)
 		}
 	}
-	if strings.Contains(full.Prompt, "Incremental re-review scope:") {
-		t.Error("the completing pass must be full scope")
-	}
-	for name, prompt := range map[string]string{"fix": fix.Prompt, "delta": delta.Prompt, "full": full.Prompt} {
+	for name, prompt := range map[string]string{"fix": fix.Prompt, "delta": delta.Prompt} {
 		if !strings.Contains(prompt, "Repository run-book") || !strings.Contains(prompt, "configured commands.test: `make test`") || !strings.Contains(prompt, "Batch independent reads") {
 			t.Errorf("%s prompt is missing the run-book", name)
 		}
 	}
 	if outcome.NeedsApproval {
-		t.Fatal("clean delta and full passes must not park")
+		t.Fatal("clean delta must not park")
 	}
 	var findings Findings
-	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil || findings.Summary != "full clean" {
-		t.Fatalf("outcome findings = %s, want the full pass's result", outcome.Findings)
+	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil || findings.Summary != "delta clean" {
+		t.Fatalf("outcome findings = %s, want the delta pass's result", outcome.Findings)
 	}
 	entries, err := os.ReadDir(sctx.RunbookDir)
 	if err != nil || len(entries) != 1 {
@@ -116,7 +115,7 @@ func TestReviewStep_LeanRereviewParksOnABlockingDeltaFinding(t *testing.T) {
 	}
 }
 
-func TestReviewStep_LeanRereviewWithoutADeltaRunsTheFullPass(t *testing.T) {
+func TestReviewStep_LeanRereviewWithoutADeltaSkipsReviewer(t *testing.T) {
 	t.Parallel()
 	sctx, ag, _ := leanRereviewContext(t, func(call int, opts agent.RunOpts) (*agent.Result, error) {
 		if call == 1 {
@@ -130,8 +129,8 @@ func TestReviewStep_LeanRereviewWithoutADeltaRunsTheFullPass(t *testing.T) {
 	if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(ag.calls) != 2 || ag.calls[1].Purpose != "review" || strings.Contains(ag.calls[1].Prompt, "Incremental re-review scope:") {
-		t.Fatalf("calls = %d (second purpose %q), want fix + one full review", len(ag.calls), ag.calls[len(ag.calls)-1].Purpose)
+	if len(ag.calls) != 1 || ag.calls[0].Purpose != "review-fix" {
+		t.Fatalf("calls = %d, want fixer only when it made no change", len(ag.calls))
 	}
 }
 
@@ -148,12 +147,15 @@ func TestReviewStep_UnlistedAgentKeepsTheExistingReviewShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(ag.calls) != 2 {
-		t.Fatalf("calls = %d, want the unchanged fix + full review", len(ag.calls))
+		t.Fatalf("calls = %d, want fix + delta review", len(ag.calls))
 	}
 	for _, call := range ag.calls {
-		if strings.Contains(call.Prompt, "Repository run-book") || strings.Contains(call.Prompt, "Incremental re-review scope:") || strings.Contains(call.Prompt, "Turn economy") {
-			t.Fatalf("an agent not listed in lean_turns must get the unchanged prompt:\n%s", call.Prompt)
+		if strings.Contains(call.Prompt, "Repository run-book") || strings.Contains(call.Prompt, "Turn economy") {
+			t.Fatalf("an agent not listed in lean_turns must not get lean guidance:\n%s", call.Prompt)
 		}
+	}
+	if !strings.Contains(ag.calls[1].Prompt, "Incremental re-review scope:") {
+		t.Fatal("delta scope must apply regardless of lean_turns membership")
 	}
 }
 

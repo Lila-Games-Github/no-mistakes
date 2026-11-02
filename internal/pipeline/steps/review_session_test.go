@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -40,6 +41,11 @@ func (m *sessionMockAgent) Run(_ context.Context, opts agent.RunOpts) (*agent.Re
 	m.calls = append(m.calls, opts)
 
 	result := m.respond(opts)
+	if opts.Purpose == "review-fix" {
+		if err := os.WriteFile(filepath.Join(opts.CWD, "review-fix.txt"), []byte(fmt.Sprintf("fix %d\n", len(m.calls))), 0o644); err != nil {
+			return nil, err
+		}
+	}
 	if opts.Session != nil {
 		if opts.Session.ID != "" {
 			result.SessionID = opts.Session.ID
@@ -82,6 +88,7 @@ func reviewSessionHarness(t *testing.T, mock *sessionMockAgent, steps []pipeline
 	cfg := &config.Config{
 		Agent:        types.AgentClaude,
 		AutoFix:      config.AutoFix{Review: 3},
+		Review:       config.Review{MaxPasses: 3},
 		SessionReuse: true,
 	}
 	exec := pipeline.NewExecutor(database, paths.WithRoot(t.TempDir()), cfg, mock, steps, nil)
@@ -91,7 +98,7 @@ func reviewSessionHarness(t *testing.T, mock *sessionMockAgent, steps []pipeline
 func reviewCalls(calls []agent.RunOpts) []agent.RunOpts {
 	var out []agent.RunOpts
 	for _, c := range calls {
-		if c.Purpose == "review" {
+		if c.Purpose == "review" || c.Purpose == "review-delta" {
 			out = append(out, c)
 		}
 	}
@@ -125,7 +132,7 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 	mock := &sessionMockAgent{}
 	mock.respond = func(opts agent.RunOpts) *agent.Result {
 		switch opts.Purpose {
-		case "review":
+		case "review", "review-delta":
 			reviewRound++
 			if reviewRound <= 2 {
 				return &agent.Result{Output: []byte(fmt.Sprintf(
@@ -213,7 +220,7 @@ func TestReviewLoop_RereviewNeverResumesTheSessionThatPrescribedItsFixes(t *test
 	mock := &sessionMockAgent{}
 	mock.respond = func(opts agent.RunOpts) *agent.Result {
 		switch opts.Purpose {
-		case "review":
+		case "review", "review-delta":
 			reviewRound++
 			if reviewRound == 1 {
 				return &agent.Result{Output: []byte(
@@ -252,7 +259,7 @@ func TestReviewLoop_ParkRespondFixKeepsRoleSessions(t *testing.T) {
 	mock := &sessionMockAgent{}
 	mock.respond = func(opts agent.RunOpts) *agent.Result {
 		switch opts.Purpose {
-		case "review":
+		case "review", "review-delta":
 			reviewRound++
 			if reviewRound == 1 {
 				return &agent.Result{Output: []byte(
@@ -309,7 +316,7 @@ func TestReviewLoop_OtherStepsStaySessionIsolated(t *testing.T) {
 	mock := &sessionMockAgent{}
 	mock.respond = func(opts agent.RunOpts) *agent.Result {
 		switch opts.Purpose {
-		case "review":
+		case "review", "review-delta":
 			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
 		default:
 			return &agent.Result{Output: []byte(`{"findings":[],"summary":"nothing to do"}`)}

@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `review.chunk_threshold_lines`, `review.chunk_max_lines`, `review.chunk_max_bytes`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.max_passes`, `review.low_risk_model`, `review.path_instructions`, `review.chunk_threshold_lines`, `review.chunk_max_lines`, `review.chunk_max_bytes`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -41,6 +41,8 @@ document:
 # Optional extra review guidance, scoped to the paths a change touches.
 # Read only from the trusted default branch.
 review:
+  # max_passes: 2
+  # low_risk_model: sonnet
   # Experimental opt-in for very large changes; 0 (the default) disables it.
   # chunk_threshold_lines: 5000
   # chunk_max_lines: 400
@@ -258,6 +260,12 @@ The document step always applies a built-in placement policy: every fact has exa
 It augments or clarifies the built-in policy; it cannot disable documentation integrity.
 
 Like `commands.*` and `agent`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`: a contributor's pushed branch cannot weaken the documentation rules that gate its own review.
+
+### review.max_passes and review.low_risk_model
+
+`review.max_passes` limits review passes across the entire run, including reviews after fixes and CI repairs. The default is `2`; `0` also selects that default. Once the limit is reached, remaining findings require an explicit approval or abort. If a CI repair changes code after the last pass, the gate also names those unreviewed changes. A further fix and review pass is refused. After the first pass, the reviewer examines only the changes since the previously reviewed head, with earlier findings supplied as context.
+
+`review.low_risk_model` optionally selects a cheaper Claude or Codex model for a later pass when the preceding review assessed the change as `low` risk. The first pass and later passes following `medium`, `high`, or missing risk assessments use the configured agent model. An empty value preserves the configured model for every pass. The chosen model, review scope, and pass limit appear in review status and the run metrics artifact.
 
 ### review.path_instructions
 

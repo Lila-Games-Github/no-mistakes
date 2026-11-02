@@ -68,10 +68,14 @@ type Invocation struct {
 }
 
 type Round struct {
-	Step       string `json:"step"`
-	Number     int    `json:"number"`
-	Fix        bool   `json:"fix"`
-	DurationMS int64  `json:"duration_ms"`
+	Step            string `json:"step"`
+	Number          int    `json:"number"`
+	Fix             bool   `json:"fix"`
+	DurationMS      int64  `json:"duration_ms"`
+	ReviewMaxPasses int    `json:"review_max_passes,omitempty"`
+	ReviewScope     string `json:"review_scope,omitempty"`
+	ReviewModel     string `json:"review_model,omitempty"`
+	RiskLevel       string `json:"risk_level,omitempty"`
 }
 
 // Artifact is an explicit allowlist. Never serialize a DB row directly: rows
@@ -221,7 +225,19 @@ func Build(database *db.DB, runID, dir string, now time.Time) (*Artifact, error)
 			return nil, err
 		}
 		for _, round := range rounds {
-			a.Rounds = append(a.Rounds, Round{p.Purpose, round.Round, round.IsFixRound(), round.DurationMS})
+			receiptRound := Round{Step: p.Purpose, Number: round.Round, Fix: round.IsFixRound(), DurationMS: round.DurationMS}
+			if p.Purpose == "review" && round.FindingsJSON != nil {
+				var review struct {
+					ReviewMaxPasses int    `json:"review_max_passes"`
+					ReviewScope     string `json:"review_scope"`
+					ReviewModel     string `json:"review_model"`
+					RiskLevel       string `json:"risk_level"`
+				}
+				if json.Unmarshal([]byte(*round.FindingsJSON), &review) == nil {
+					receiptRound.ReviewMaxPasses, receiptRound.ReviewScope, receiptRound.ReviewModel, receiptRound.RiskLevel = review.ReviewMaxPasses, review.ReviewScope, review.ReviewModel, review.RiskLevel
+				}
+			}
+			a.Rounds = append(a.Rounds, receiptRound)
 			if round.IsFixRound() {
 				p.FixRounds++
 			}

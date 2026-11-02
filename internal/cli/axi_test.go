@@ -114,6 +114,19 @@ func TestWriteRunObjectShape(t *testing.T) {
 	}
 }
 
+func TestRunObjectShowsReviewLimitScopeModelAndRisk(t *testing.T) {
+	rv := runView{
+		ID: "run-review", Branch: "feature/review", Status: string(types.RunRunning),
+		Steps: []stepView{{Name: "review", Status: "awaiting_approval", FindingsJSON: `{"findings":[],"summary":"remaining concern","risk_level":"low","review_max_passes":2,"review_scope":"delta","review_model":"sonnet"}`}},
+	}
+	out := axiDoc(runObjectField(rv))
+	for _, want := range []string{"review_pass_limit: 2", "review_scope: delta", "review_model: sonnet", "review_risk: low"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run status missing %q in:\n%s", want, out)
+		}
+	}
+}
+
 func TestRunObjectRendersAwaitingAgent(t *testing.T) {
 	// Pin the clock so the parked duration is deterministic.
 	restore := nowUnix

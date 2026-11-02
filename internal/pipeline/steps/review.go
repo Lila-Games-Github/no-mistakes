@@ -52,12 +52,23 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	}
 
 	reviewScope := fmt.Sprintf("branch changes between %s and %s", baseSHA, sctx.Run.HeadSHA)
+	deltaBase := ""
+	if sctx.ReviewPass > 1 {
+		deltaBase = strings.TrimSpace(sctx.ReviewPreviousHeadSHA)
+		if deltaBase == "" {
+			return nil, fmt.Errorf("review pass %d has no previously reviewed head for incremental re-review", sctx.ReviewPass)
+		}
+		reviewScope = fmt.Sprintf("only the changes since previously reviewed head %s, including current worktree changes", deltaBase)
+	}
 	if sctx.Fixing {
 		startingHeadSHA := sctx.ReviewStartingHeadSHA
 		if startingHeadSHA == "" {
 			startingHeadSHA = sctx.Run.HeadSHA
 		}
 		reviewScope = fmt.Sprintf("current worktree and HEAD changes relative to base commit %s (starting head %s)", baseSHA, startingHeadSHA)
+		if deltaBase != "" {
+			reviewScope = fmt.Sprintf("only the changes since previously reviewed head %s, including current worktree changes", deltaBase)
+		}
 	}
 
 	// Bounded workload size (changed files + net lines) for local telemetry, so
@@ -152,7 +163,9 @@ Previous review findings to address:
 	// ignore-filtered subset keeps the legacy small-review skip, while trusted
 	// path instructions and an enabled large-diff review use the complete set.
 	var args []string
-	if sctx.Fixing {
+	if deltaBase != "" {
+		args = []string{"diff", "--name-only", "-z", "--no-renames", deltaBase}
+	} else if sctx.Fixing {
 		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA}
 	} else {
 		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA + ".." + sctx.Run.HeadSHA}
@@ -163,7 +176,9 @@ Previous review findings to address:
 	}
 	changed := changedPathList(string(changedFilesRaw))
 	diffRange := baseSHA + ".." + sctx.Run.HeadSHA
-	if sctx.Fixing {
+	if deltaBase != "" {
+		diffRange = deltaBase
+	} else if sctx.Fixing {
 		diffRange = baseSHA
 	}
 	var patch string
@@ -192,6 +207,12 @@ Previous review findings to address:
 	// Ask agent to review
 	sctx.Log("reviewing changes...")
 	startReviewTimeout()
+	if sctx.ReviewPass > 1 && sctx.ReviewPreviousRisk == "low" {
+		sctx.ReviewModel = sctx.Config.Review.LowRiskModel
+		if sctx.ReviewModel != "" && sctx.Agent.Name() != string(types.AgentClaude) && sctx.Agent.Name() != string(types.AgentCodex) {
+			return nil, fmt.Errorf("review.low_risk_model requires a claude or codex review agent, got %s", sctx.Agent.Name())
+		}
+	}
 
 	// The review turn (initial and every post-fix rereview) carries the intent
 	// conformance obligation: when the intent is authoritative acceptance
@@ -286,6 +307,9 @@ Risk assessment (after listing all findings):
 	}
 	basePrompt := buildReviewPrompt(reviewScope, "")
 	prompt := basePrompt + pathInstructions
+	if deltaBase != "" {
+		prompt = buildReviewPrompt(reviewScope, incrementalRereviewClause(baseSHA, deltaBase, changed)) + pathInstructions
+	}
 
 	// Every review turn - the initial review and every post-fix rereview -
 	// deliberately runs session-free. Round N's fixes implement round N-1's
@@ -302,6 +326,7 @@ Risk assessment (after listing all findings):
 		var turnFindings Findings
 		result, runErr := sctx.RunAgentContext(ctx, agent.RunOpts{
 			Prompt:     turnPrompt,
+			Model:      sctx.ReviewModel,
 			CWD:        sctx.WorkDir,
 			Env:        sctx.Env,
 			JSONSchema: reviewFindingsSchema,
@@ -323,41 +348,19 @@ Risk assessment (after listing all findings):
 		return stripDeliveryFindings(sctx, turnFindings), nil
 	}
 
-	// Incremental re-review (lean_turns): after a fix round, first review only
-	// the fix-round delta plus the findings that prompted it. The previous
-	// round already reviewed everything up to its starting head, so redoing the
-	// whole branch diff after a small fix is the dominant repeated cost on slow
-	// harnesses. A delta pass can only ever park the round; it never completes
-	// the step. When it finds nothing blocking, the full-scope review below
-	// still runs, so the review that lets this step complete has always seen
-	// the entire change.
-	if deltaBase, deltaPaths, ok := incrementalRereviewDelta(sctx, lean, chunked); ok {
-		sctx.Log(fmt.Sprintf("incremental re-review: reviewing the fix-round delta since %s (%d path(s))", shortSHA(deltaBase), len(deltaPaths)))
-		deltaFindings, err := singleTurn(buildReviewPrompt(fmt.Sprintf("fix-round delta: current worktree and HEAD changes relative to %s", deltaBase), incrementalRereviewClause(baseSHA, deltaBase, deltaPaths))+pathInstructions, "review-delta")
-		if err != nil {
-			return nil, err
-		}
-		if hasBlockingFindings(deltaFindings.Items) {
-			findingsJSON, _ := json.Marshal(deltaFindings)
-			return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
-				NeedsApproval: true,
-				AutoFixable:   len(deltaFindings.Items) > 0,
-				Findings:      string(findingsJSON),
-				FixSummary:    fixSummary,
-			})
-		}
-		sctx.Log("incremental re-review found nothing blocking; running the full-scope review before the step can complete")
-	}
-
 	var findings Findings
 	if chunked {
-		findings, err = runChunkedReview(ctx, sctx, basePrompt, diffRange, changed, patch)
+		findings, err = runChunkedReview(ctx, sctx, prompt, diffRange, changed, patch)
 		if err != nil {
 			return nil, reviewAgentError(ctx, timeout, "agent review", err)
 		}
 		findings = stripDeliveryFindings(sctx, findings)
 	} else {
-		findings, err = singleTurn(prompt, "review")
+		purpose := "review"
+		if deltaBase != "" {
+			purpose = "review-delta"
+		}
+		findings, err = singleTurn(prompt, purpose)
 		if err != nil {
 			return nil, err
 		}
@@ -371,6 +374,8 @@ Risk assessment (after listing all findings):
 		AutoFixable:   len(findings.Items) > 0,
 		Findings:      string(findingsJSON),
 		FixSummary:    fixSummary,
+		ReviewModel:   sctx.ReviewModel,
+		ReviewScope:   map[bool]string{true: "delta", false: "full"}[deltaBase != ""],
 	})
 }
 

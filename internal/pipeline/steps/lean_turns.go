@@ -102,9 +102,8 @@ func incrementalRereviewDelta(sctx *pipeline.StepContext, lean config.LeanTurns,
 const maxDeltaPathsInPrompt = 40
 
 // incrementalRereviewClause scopes a re-review to the fix-round delta. It
-// narrows only where the reviewer looks first; the adversarial standard and
-// every other rule above still apply, and the step cannot complete on this
-// pass alone.
+// narrows the re-review to changes since the previously reviewed head while
+// retaining the same standard for the changed code.
 func incrementalRereviewClause(baseSHA, deltaBase string, paths []string) string {
 	listed := paths
 	more := ""
@@ -123,6 +122,6 @@ Incremental re-review scope:
 - This pass reviews the fix-round delta: `+"`git diff %s`"+` (commits after %s plus any uncommitted worktree changes). Changed paths: %s%s.
 - Verify that each previous finding the fix round addressed is actually resolved by the current code, and review the delta itself - including how it interacts with surrounding code, call sites, and tests - under the same standard as the original change.
 - Do not re-review unchanged parts of the branch. Report an issue outside the delta only when the delta introduces it or makes it newly reachable.
-- A full-scope review of the whole branch still runs before this review step can complete.
+- This delta review is the complete review pass; return all material findings introduced or made reachable by the delta.
 `, baseSHA, deltaBase, deltaBase, deltaBase, strings.Join(sanitized, ", "), more)
 }

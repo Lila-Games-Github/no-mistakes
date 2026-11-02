@@ -271,6 +271,12 @@ type DocumentRaw struct {
 
 // ReviewRaw is the YAML representation of review-step settings.
 type ReviewRaw struct {
+	// MaxPasses bounds review passes in one run. Zero uses the safe default of two.
+	MaxPasses int `yaml:"max_passes"`
+	// LowRiskModel selects a cheaper model for a later review pass when the
+	// preceding pass assessed the change as low risk. Empty preserves the
+	// configured agent model.
+	LowRiskModel string `yaml:"low_risk_model"`
 	// PathInstructions scope extra review guidance to the paths a change
 	// actually touches. The review step appends the blocks whose glob matches
 	// at least one changed file; a run that touches nothing matching leaves
@@ -287,6 +293,14 @@ type ReviewRaw struct {
 	// size-dependent default (128 KiB per turn for patches up to 1 MiB,
 	// 256 KiB above).
 	ChunkMaxBytes int `yaml:"chunk_max_bytes"`
+}
+
+// ReviewPassLimit is the maximum number of reviewer passes in one run.
+func (r ReviewRaw) ReviewPassLimit() int {
+	if r.MaxPasses == 0 {
+		return 2
+	}
+	return r.MaxPasses
 }
 
 // PRRaw is the YAML representation of pull-request settings.
@@ -552,10 +566,20 @@ type Document struct {
 // default-branch repo config. PathInstructions scope extra guidance to changed
 // paths; ChunkThresholdLines opts in to bounded turns for large diffs.
 type Review struct {
+	MaxPasses           int
+	LowRiskModel        string
 	PathInstructions    []PathInstruction
 	ChunkThresholdLines int
 	ChunkMaxLines       int
 	ChunkMaxBytes       int
+}
+
+// ReviewPassLimit uses two passes unless the trusted repository sets a limit.
+func (r Review) ReviewPassLimit() int {
+	if r.MaxPasses == 0 {
+		return 2
+	}
+	return r.MaxPasses
 }
 
 // TestRaw is the YAML representation of test-step settings.
@@ -2060,6 +2084,9 @@ const (
 // invalid block has to fail here, before it merges, rather than brick the
 // repository's pipeline afterwards. Do not scope this to the trusted copy.
 func validateReviewRaw(review ReviewRaw) error {
+	if review.MaxPasses < 0 {
+		return fmt.Errorf("review.max_passes must be positive or 0 (default)")
+	}
 	if review.ChunkThresholdLines < 0 || (review.ChunkThresholdLines > 0 && review.ChunkThresholdLines <= 500) {
 		return fmt.Errorf("review.chunk_threshold_lines must be 0 (disabled) or greater than 500")
 	}
@@ -2560,7 +2587,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Intent:         intent,
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
-		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines, ChunkMaxLines: repo.Review.ChunkMaxLines, ChunkMaxBytes: repo.Review.ChunkMaxBytes},
+		Review:         Review{MaxPasses: repo.Review.MaxPasses, LowRiskModel: strings.TrimSpace(repo.Review.LowRiskModel), PathInstructions: resolvePathInstructions(repo.Review.PathInstructions), ChunkThresholdLines: repo.Review.ChunkThresholdLines, ChunkMaxLines: repo.Review.ChunkMaxLines, ChunkMaxBytes: repo.Review.ChunkMaxBytes},
 		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
 		ForgeProfiles:  global.ForgeProfiles,
 		// repo is the EffectiveRepoConfig result, so this value is already
