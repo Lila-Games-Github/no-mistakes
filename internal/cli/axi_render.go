@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
 )
@@ -33,6 +34,21 @@ type stepRow struct {
 	Status     string `toon:"status"`
 	Findings   int    `toon:"findings"`
 	DurationMS int64  `toon:"duration_ms"`
+}
+
+type stepUsageRow struct {
+	Step            string `toon:"step"`
+	InputTokens     string `toon:"input_tokens"`
+	OutputTokens    string `toon:"output_tokens"`
+	ModelRoundtrips string `toon:"model_roundtrips"`
+	AgentMS         int64  `toon:"agent_ms"`
+}
+
+func optionalMetric(value *int64) string {
+	if value == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", *value)
 }
 
 type activeStepRow struct {
@@ -108,6 +124,7 @@ type runView struct {
 	// the top-level parked signal in the run object.
 	AwaitingAgentSince *int64
 	Steps              []stepView
+	Metrics            *runmetrics.Artifact
 }
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
@@ -435,6 +452,24 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		fields = append(fields, toon.Field{Key: "pr", Value: rv.PRURL})
 	}
 	fields = append(fields, toon.Field{Key: "findings", Value: rv.findingsTally()})
+	if rv.Metrics != nil {
+		if ready := rv.Metrics.CIReady.WallMS; ready != nil {
+			fields = append(fields, toon.Field{Key: "ci_ready_wall_ms", Value: *ready})
+			if wait := rv.Metrics.CIReady.ChecksWaitMS; wait != nil {
+				fields = append(fields, toon.Field{Key: "ci_checks_wait_ms", Value: *wait})
+			}
+		}
+		if usage := rv.Metrics.RunUsage.InputTokens; usage != nil {
+			fields = append(fields, toon.Field{Key: "input_tokens", Value: *usage})
+		}
+		if usage := rv.Metrics.RunUsage.OutputTokens; usage != nil {
+			fields = append(fields, toon.Field{Key: "output_tokens", Value: *usage})
+		}
+		if trips := rv.Metrics.RunUsage.ModelRoundtrips; trips != nil {
+			fields = append(fields, toon.Field{Key: "model_roundtrips", Value: *trips})
+		}
+		fields = append(fields, toon.Field{Key: "agent_ms", Value: rv.Metrics.RunUsage.AgentMS})
+	}
 	for _, step := range rv.Steps {
 		if step.Name != string(types.StepReview) || step.FindingsJSON == "" {
 			continue
@@ -450,6 +485,13 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		rows = append(rows, stepRow{Step: s.Name, Status: s.Status, Findings: s.findingCount(), DurationMS: s.DurationMS})
 	}
 	fields = append(fields, toon.Field{Key: "steps", Value: rows})
+	if rv.Metrics != nil && len(rv.Metrics.StepUsage) > 0 {
+		usageRows := make([]stepUsageRow, 0, len(rv.Metrics.StepUsage))
+		for _, usage := range rv.Metrics.StepUsage {
+			usageRows = append(usageRows, stepUsageRow{Step: usage.Step, InputTokens: optionalMetric(usage.InputTokens), OutputTokens: optionalMetric(usage.OutputTokens), ModelRoundtrips: optionalMetric(usage.ModelRoundtrips), AgentMS: usage.AgentMS})
+		}
+		fields = append(fields, toon.Field{Key: "step_usage", Value: usageRows})
+	}
 	if activeRows := rv.activeRows(); len(activeRows) > 0 {
 		fields = append(fields, toon.Field{Key: "active_steps", Value: activeRows})
 	}

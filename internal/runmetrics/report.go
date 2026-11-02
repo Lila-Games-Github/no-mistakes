@@ -56,6 +56,9 @@ type Invocation struct {
 	FailureClass     string `json:"failure_class"`
 	SessionMode      string `json:"session_mode"`
 	InputTokens      *int   `json:"input_tokens"`
+	TotalInputTokens *int   `json:"total_input_tokens"`
+	OutputTokens     *int   `json:"output_tokens"`
+	ModelRoundtrips  *int   `json:"model_roundtrips"`
 	CacheReadTokens  *int   `json:"cache_read_tokens"`
 	FreshInputTokens *int   `json:"fresh_input_tokens"`
 	SubprocessWaitMS *int64 `json:"subprocess_wait_ms"`
@@ -67,15 +70,33 @@ type Invocation struct {
 	ProviderQueueMS  *int64 `json:"provider_queue_ms"`
 }
 
+type UsageTotals struct {
+	InputTokens     *int64 `json:"input_tokens"`
+	OutputTokens    *int64 `json:"output_tokens"`
+	ModelRoundtrips *int64 `json:"model_roundtrips"`
+	AgentMS         int64  `json:"agent_ms"`
+}
+
+type StepUsage struct {
+	Step string `json:"step"`
+	UsageTotals
+}
+
+type ReadyTiming struct {
+	WallMS       *int64 `json:"wall_ms"`
+	ChecksWaitMS *int64 `json:"checks_wait_ms"`
+}
+
 type Round struct {
-	Step            string `json:"step"`
-	Number          int    `json:"number"`
-	Fix             bool   `json:"fix"`
-	DurationMS      int64  `json:"duration_ms"`
-	ReviewMaxPasses int    `json:"review_max_passes,omitempty"`
-	ReviewScope     string `json:"review_scope,omitempty"`
-	ReviewModel     string `json:"review_model,omitempty"`
-	RiskLevel       string `json:"risk_level,omitempty"`
+	Step               string `json:"step"`
+	Number             int    `json:"number"`
+	Fix                bool   `json:"fix"`
+	DurationMS         int64  `json:"duration_ms"`
+	ReviewMaxPasses    int    `json:"review_max_passes,omitempty"`
+	ReviewScope        string `json:"review_scope,omitempty"`
+	ReviewModel        string `json:"review_model,omitempty"`
+	RiskLevel          string `json:"risk_level,omitempty"`
+	UnreviewedFinalFix bool   `json:"unreviewed_final_fix,omitempty"`
 }
 
 // Artifact is an explicit allowlist. Never serialize a DB row directly: rows
@@ -93,6 +114,10 @@ type Artifact struct {
 	Phases             []Phase      `json:"phases"`
 	Rounds             []Round      `json:"rounds"`
 	Invocations        []Invocation `json:"invocations"`
+	RunUsage           UsageTotals  `json:"run_usage"`
+	StepUsage          []StepUsage  `json:"step_usage"`
+	CIReady            ReadyTiming  `json:"ci_ready"`
+	UnreviewedFinalFix bool         `json:"unreviewed_final_fix"`
 	Details            []Detail     `json:"details"`
 	Health             Health       `json:"collection_health"`
 	JournalPresent     bool         `json:"journal_present"`
@@ -160,7 +185,21 @@ func Build(database *db.DB, runID, dir string, now time.Time) (*Artifact, error)
 	}
 	info, statErr := os.Stat(filepath.Join(dir, JournalName))
 	a := &Artifact{SchemaVersion: Version, RunID: run.ID, Status: string(run.Status), GeneratedAt: now.UTC(), JournalPresent: statErr == nil && info.Mode().IsRegular(), TornJournal: torn, CollectionProblem: journalProblem,
-		Phases: []Phase{}, Rounds: []Round{}, Invocations: []Invocation{}, Details: []Detail{}}
+		Phases: []Phase{}, Rounds: []Round{}, Invocations: []Invocation{}, StepUsage: []StepUsage{}, Details: []Detail{}}
+	if run.CIReadyAt != nil {
+		readyMS := *run.CIReadyAt * 1000
+		a.CIReady.WallMS = ptr(max(int64(0), readyMS-run.CreatedAt*1000))
+		waitMS := int64(0)
+		for _, span := range spans {
+			if span.Operation != CIPollWait || span.StartedMS >= readyMS {
+				continue
+			}
+			waitMS += max(int64(0), min(span.WallMS, readyMS-span.StartedMS))
+		}
+		if err == nil {
+			a.CIReady.ChecksWaitMS = ptr(waitMS)
+		}
+	}
 	// Health is cumulative across resumed executors; missing health on an
 	// active/crashed writer means completeness is not certified.
 	if b, readErr := os.ReadFile(filepath.Join(dir, "metrics-health.json")); readErr == nil {
@@ -225,7 +264,10 @@ func Build(database *db.DB, runID, dir string, now time.Time) (*Artifact, error)
 			return nil, err
 		}
 		for _, round := range rounds {
-			receiptRound := Round{Step: p.Purpose, Number: round.Round, Fix: round.IsFixRound(), DurationMS: round.DurationMS}
+			receiptRound := Round{Step: p.Purpose, Number: round.Round, Fix: round.IsFixRound(), DurationMS: round.DurationMS, UnreviewedFinalFix: round.Trigger == "final_fix_unreviewed"}
+			if receiptRound.UnreviewedFinalFix {
+				a.UnreviewedFinalFix = true
+			}
 			if p.Purpose == "review" && round.FindingsJSON != nil {
 				var review struct {
 					ReviewMaxPasses int    `json:"review_max_passes"`
@@ -293,12 +335,33 @@ func Build(database *db.DB, runID, dir string, now time.Time) (*Artifact, error)
 			a.Phases[i].ObservedTiming.ActiveMS = nil
 		}
 	}
+	usageByStep := make(map[string]*StepUsage)
 	for _, inv := range invocations {
+		input := invocationTotalInput(inv)
 		a.Invocations = append(a.Invocations, Invocation{Step: inv.StepName, Round: inv.Round, Purpose: inv.Purpose, DurationMS: inv.DurationMS,
 			Outcome: inv.ExitStatus, FailureClass: inv.FailureCategory, SessionMode: inv.SessionMode, InputTokens: inv.DeltaInputTokens,
+			TotalInputTokens: input, OutputTokens: inv.DeltaOutputTokens, ModelRoundtrips: inv.ModelRoundtrips,
 			CacheReadTokens: inv.DeltaCacheReadTokens, FreshInputTokens: inv.FreshInputTokens, SubprocessWaitMS: inv.SubprocessWaitMS,
 			ChangedFiles: inv.WorkloadFiles, ChangedLines: inv.WorkloadLines, ToolCalls: inv.ToolCalls, TestLintCalls: inv.ToolTestLintCalls, FindingCount: inv.FindingCount})
+		step := usageByStep[inv.StepName]
+		if step == nil {
+			step = &StepUsage{Step: inv.StepName, UsageTotals: UsageTotals{InputTokens: ptr(int64(0)), OutputTokens: ptr(int64(0)), ModelRoundtrips: ptr(int64(0))}}
+			usageByStep[inv.StepName] = step
+		}
+		step.AgentMS += inv.DurationMS
+		addNullable(&step.InputTokens, input)
+		addNullable(&step.OutputTokens, inv.DeltaOutputTokens)
+		addNullable(&step.ModelRoundtrips, inv.ModelRoundtrips)
 	}
+	a.RunUsage = UsageTotals{InputTokens: ptr(int64(0)), OutputTokens: ptr(int64(0)), ModelRoundtrips: ptr(int64(0))}
+	for _, step := range usageByStep {
+		a.StepUsage = append(a.StepUsage, *step)
+		a.RunUsage.AgentMS += step.AgentMS
+		addNullable64(&a.RunUsage.InputTokens, step.InputTokens)
+		addNullable64(&a.RunUsage.OutputTokens, step.OutputTokens)
+		addNullable64(&a.RunUsage.ModelRoundtrips, step.ModelRoundtrips)
+	}
+	sort.Slice(a.StepUsage, func(i, j int) bool { return a.StepUsage[i].Step < a.StepUsage[j].Step })
 	prior, err := database.GetRunsByRepo(run.RepoID)
 	if err != nil {
 		return nil, err
@@ -311,10 +374,55 @@ func Build(database *db.DB, runID, dir string, now time.Time) (*Artifact, error)
 	return a, nil
 }
 
+func invocationTotalInput(inv db.AgentInvocation) *int {
+	if inv.DeltaInputTokens == nil {
+		return nil
+	}
+	total := *inv.DeltaInputTokens
+	if inv.Agent == "claude" && inv.DeltaCacheReadTokens != nil {
+		total += *inv.DeltaCacheReadTokens
+	}
+	if inv.CacheCreationTokens != nil {
+		total += *inv.CacheCreationTokens
+	}
+	return &total
+}
+
+func addNullable(dst **int64, src *int) {
+	if *dst == nil {
+		return
+	}
+	if src == nil {
+		*dst = nil
+		return
+	}
+	**dst += int64(*src)
+}
+
+func addNullable64(dst **int64, src *int64) {
+	if *dst == nil {
+		return
+	}
+	if src == nil {
+		*dst = nil
+		return
+	}
+	**dst += *src
+}
+
 func Summary(a *Artifact) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Run %s (%s), metrics v%d\n", a.RunID, a.Status, a.SchemaVersion)
 	fmt.Fprintf(&b, "Wall %.1fs; persisted step execution %.1fs; human gates %.1fs\n", float64(*a.Timing.WallMS)/1000, float64(value(a.Timing.ExecutionMS))/1000, float64(*a.Timing.HumanWaitMS)/1000)
+	if a.CIReady.WallMS != nil {
+		fmt.Fprintf(&b, "CI ready after %.1fs; check polling before ready %.1fs\n", float64(*a.CIReady.WallMS)/1000, float64(value(a.CIReady.ChecksWaitMS))/1000)
+	}
+	if a.RunUsage.InputTokens != nil {
+		fmt.Fprintf(&b, "Agent input %d tokens; output %d tokens; model round trips %d; agent wall %.1fs\n", *a.RunUsage.InputTokens, value(a.RunUsage.OutputTokens), value(a.RunUsage.ModelRoundtrips), float64(a.RunUsage.AgentMS)/1000)
+	}
+	if a.UnreviewedFinalFix {
+		fmt.Fprintln(&b, "Final review fix was applied without another review pass (explicit decider choice).")
+	}
 	if a.ObservedTiming.ExternalWaitMS != nil {
 		fmt.Fprintf(&b, "Observed external waits %.1fs", float64(*a.ObservedTiming.ExternalWaitMS)/1000)
 		if a.ObservedTiming.ActiveMS == nil {

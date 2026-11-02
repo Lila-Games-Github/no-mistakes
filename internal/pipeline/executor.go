@@ -186,7 +186,11 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 	}
 	if step == types.StepReview && action == types.ActionFix && e.waitingReviewLimit {
 		e.mu.Unlock()
-		return fmt.Errorf("review pass limit reached (%d): approve or abort the remaining findings; a third review pass cannot start", e.reviewPassLimit())
+		return fmt.Errorf("review pass limit reached (%d): approve, abort, or use fix-final for named fixes without another review pass", e.reviewPassLimit())
+	}
+	if action == types.ActionFixFinal && (step != types.StepReview || !e.waitingReviewLimit) {
+		e.mu.Unlock()
+		return fmt.Errorf("fix-final is available only at the review pass limit")
 	}
 	if step == types.StepReview && action == types.ActionSkip && !e.skips[types.StepPush] {
 		// Recovery has no in-memory skip list. A Push step already marked
@@ -332,7 +336,7 @@ func (e *Executor) prepareRestart(runID string, name types.StepName, currentInde
 }
 
 func (e *Executor) initializeRunScopes(runID string) {
-	sessionsEnabled := e.config != nil && e.config.SessionReuse && e.agent != nil
+	sessionsEnabled := e.config != nil && e.config.SessionReuse && !e.config.ContextBrief && e.agent != nil
 	e.sessions = NewRunSessions(e.db, runID, e.agent, sessionsEnabled)
 	if sessionsEnabled {
 		e.sessions.SetContextBudget(e.config.LeanTurnsFor(types.AgentName(e.agent.Name())).FixerSessionMaxContextTokens)
@@ -342,6 +346,7 @@ func (e *Executor) initializeRunScopes(runID string) {
 
 type stepExecutionState struct {
 	fixing               bool
+	finalFixNoReview     bool
 	previousFindings     string
 	roundNum             int
 	autoFixAttempts      int
@@ -526,6 +531,11 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		approvalFields["selected_findings_count"] = selectedCount
 	}
 	telemetry.Track("approval", approvalFields)
+	if e.config != nil && e.config.ContextBrief {
+		if err := appendContextDecision(logDir, gate.step.Name(), response.action, response.findingIDs); err != nil {
+			return e.failRun(run, repo, err, ctx)
+		}
+	}
 	switch response.action {
 	case types.ActionApprove:
 		e.recordDeclinedRound(gate.lastRoundID, gate.findings, gate.step.Name(), gate.round)
@@ -548,7 +558,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", "aborted by user", &duration)
 		return e.failRun(run, repo, fmt.Errorf("step %s: aborted by user", gate.step.Name()), ctx)
-	case types.ActionFix:
+	case types.ActionFix, types.ActionFixFinal:
 		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
 		selected := filterFindingsJSON(gate.findings, response.findingIDs)
 		merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
@@ -570,6 +580,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFixing), "", "", nil)
 		skipRemaining, restartFrom, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
 			fixing:               true,
+			finalFixNoReview:     response.action == types.ActionFixFinal,
 			previousFindings:     merged,
 			roundNum:             gate.round,
 			previousReviewedHead: gate.reviewedHeadSHA,
@@ -903,25 +914,28 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		e.emitCIReadinessEvent(run, repo, ready, declaredNoCI)
 	}
 	sctx := &StepContext{
-		Ctx:              ctx,
-		Run:              run,
-		Repo:             repo,
-		WorkDir:          workDir,
-		Agent:            stepAgent,
-		Config:           e.config,
-		ForgeContext:     e.forge,
-		DB:               e.db,
-		StepResultID:     sr.ID,
-		UserIntent:       userIntent,
-		IntentSource:     userIntentSource,
-		Sessions:         e.sessions,
-		Shared:           e.shared,
-		EvidenceDir:      e.runEvidenceDir(run.ID),
-		RunbookDir:       e.runbookDir(repo),
-		Fixing:           state.fixing,
-		PreviousFindings: state.previousFindings,
-		Log:              writeLog,
-		LogChunk:         writeLogChunk,
+		Ctx:                   ctx,
+		Run:                   run,
+		Repo:                  repo,
+		WorkDir:               workDir,
+		Agent:                 stepAgent,
+		Config:                e.config,
+		ForgeContext:          e.forge,
+		DB:                    e.db,
+		StepResultID:          sr.ID,
+		StepName:              stepName,
+		UserIntent:            userIntent,
+		IntentSource:          userIntentSource,
+		Sessions:              e.sessions,
+		Shared:                e.shared,
+		EvidenceDir:           e.runEvidenceDir(run.ID),
+		RunbookDir:            e.runbookDir(repo),
+		BriefDir:              logDir,
+		Fixing:                state.fixing,
+		FinalFixWithoutReview: state.finalFixNoReview,
+		PreviousFindings:      state.previousFindings,
+		Log:                   writeLog,
+		LogChunk:              writeLogChunk,
 		LogFile: func(text string) {
 			fmt.Fprintln(logFile, text)
 			touchLogActivity(text, true)
@@ -956,7 +970,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		sctx.ReviewPreviousRisk = state.previousRisk
 		var outcome *StepOutcome
 		var err error
-		if limitReached {
+		if limitReached && !sctx.FinalFixWithoutReview {
 			// A late CI repair can restart validation after the final review
 			// pass. Park an explicit gate without invoking another reviewer or
 			// inventing a third round in the receipt.
@@ -968,10 +982,10 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				ID:          "review-pass-limit",
 				Severity:    "warning",
 				Action:      string(types.ActionAskUser),
-				Description: "Changes made after the final review pass have not been reviewed; approve or abort this run.",
+				Description: "Changes made after the final review pass have not been reviewed; approve, abort, or use fix-final for a named fix without re-review.",
 				ReviewScope: types.FindingReviewScopeSource,
 			})
-			findings.Summary = fmt.Sprintf("Review pass limit reached (%d). Remaining findings require approval or abort; no further review pass can start. %s", e.reviewPassLimit(), findings.Summary)
+			findings.Summary = fmt.Sprintf("Review pass limit reached (%d). Approve, abort, or apply named fixes with fix-final without re-review. %s", e.reviewPassLimit(), findings.Summary)
 			findings.ReviewMaxPasses = e.reviewPassLimit()
 			findings.ReviewScope = "escalation"
 			findings.ReviewModel = "none"
@@ -1021,7 +1035,18 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			}
 		}
 		outcome.Findings = normalizeFindingsJSON(outcome.Findings, string(stepName))
-		if limitReached {
+		if e.config != nil && e.config.ContextBrief {
+			if err := appendContextOutcome(logDir, stepName, outcome); err != nil {
+				return false, "", err
+			}
+		}
+		if limitReached && !sctx.FinalFixWithoutReview {
+			reviewApprovedHeadSHA = outcome.ReviewApprovedHeadSHA
+		}
+		if outcome.FinalFixUnreviewed {
+			// The decider authorized shipping this head without another review.
+			// The receipt records that exception; Push still requires an exact
+			// authorized head rather than accepting arbitrary later edits.
 			reviewApprovedHeadSHA = outcome.ReviewApprovedHeadSHA
 		}
 		if stepName == types.StepReview && roundNum >= e.reviewPassLimit() && outcome.AutoFixable && autoFixableFindingsJSON(outcome.Findings) != "" {
@@ -1046,7 +1071,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 					}
 				}
 				if !limitReached && roundNum >= e.reviewPassLimit() && outcome.NeedsApproval {
-					findings.Summary = fmt.Sprintf("Review pass limit reached (%d). Remaining findings require approval or abort; no further fix and review pass can start. %s", e.reviewPassLimit(), findings.Summary)
+					findings.Summary = fmt.Sprintf("Review pass limit reached (%d). Approve, abort, or use fix-final for named fixes without re-review. %s", e.reviewPassLimit(), findings.Summary)
 				}
 				if encoded, marshalErr := types.MarshalFindingsJSON(findings); marshalErr == nil {
 					outcome.Findings = encoded
@@ -1079,11 +1104,16 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		var inserted *db.StepRound
 		var dbErr error
 		roundTrigger := nextTrigger
+		if outcome.FinalFixUnreviewed {
+			roundTrigger = "final_fix_unreviewed"
+		}
 		if stepName == types.StepCI && restartFrom != "" && !sctx.Fixing {
 			roundTrigger = "auto_fix"
 		}
-		if limitReached {
+		if limitReached && !outcome.FinalFixUnreviewed {
 			inserted = nil
+		} else if outcome.FinalFixUnreviewed {
+			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		} else if stepName == types.StepReview {
 			if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
@@ -1093,7 +1123,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		} else {
 			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		}
-		if limitReached {
+		if limitReached && !outcome.FinalFixUnreviewed {
 			// Keep the last real review round as the gate's durable decision.
 		} else if dbErr != nil {
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)
@@ -1219,6 +1249,11 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			approvalFields["selected_findings_count"] = selectedCount
 		}
 		telemetry.Track("approval", approvalFields)
+		if e.config != nil && e.config.ContextBrief {
+			if err := appendContextDecision(logDir, stepName, response.action, response.findingIDs); err != nil {
+				return false, "", err
+			}
+		}
 
 		switch response.action {
 		case types.ActionApprove:
@@ -1245,7 +1280,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", "aborted by user", &executionMS)
 			return false, "", fmt.Errorf("step %s: aborted by user", stepName)
 
-		case types.ActionFix:
+		case types.ActionFix, types.ActionFixFinal:
 			telemetry.Track("fix", e.fixTelemetryFields("user", stepName, selectedFindingCount(outcome.Findings, response.findingIDs), 0))
 			// Fix - mark step as fixing, resume execution timer, re-execute.
 			phaseStart = time.Now()
@@ -1255,10 +1290,14 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				slog.Warn("failed to update step status in db", "step", stepName, "status", "fixing", "error", dbErr)
 			}
 			sctx.Fixing = true
+			sctx.FinalFixWithoutReview = response.action == types.ActionFixFinal
 			selectedFindings := filterFindingsJSON(outcome.Findings, response.findingIDs)
 			mergedFindings := mergeUserOverridesJSON(selectedFindings, response.instructions, response.addedFindings)
 			sctx.PreviousFindings = mergedFindings
 			nextTrigger = "auto_fix"
+			if sctx.FinalFixWithoutReview {
+				nextTrigger = "final_fix_unreviewed"
+			}
 			if currentRoundID != "" {
 				allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)
 				if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {

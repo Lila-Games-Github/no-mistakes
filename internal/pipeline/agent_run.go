@@ -8,6 +8,13 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+const (
+	defaultRunInputBudget    = 1_500_000
+	defaultReviewInputBudget = 150_000
 )
 
 // ErrAgentTimeout is the context cause used when the default per-invocation
@@ -58,8 +65,36 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	if sctx != nil {
 		ag = sctx.Agent
 		timeout = AgentTimeout(sctx.Config)
+		brief, err := sctx.preparedContextBrief(parent)
+		if err != nil {
+			return nil, err
+		}
+		if brief != "" {
+			opts.PreparedContext = true
+			log, err := sctx.contextRunningLog()
+			if err != nil {
+				return nil, err
+			}
+			opts.Prompt = brief + "\n---\nRunning log (outcomes and decisions only):\n" + log + "\nCurrent pipeline step:\n" + opts.Prompt
+		}
+		if sctx.Config != nil && sctx.Config.ContextBrief && sctx.DB != nil && sctx.Run != nil {
+			spent, err := sctx.recordedRunInputTokens()
+			if err != nil {
+				return nil, err
+			}
+			limit := defaultRunInputBudget - spent
+			if limit <= 0 {
+				return nil, fmt.Errorf("%w: run consumed %d of %d input tokens", agent.ErrInputTokenBudget, spent, defaultRunInputBudget)
+			}
+			if sctx.StepName == types.StepReview && limit > defaultReviewInputBudget {
+				limit = defaultReviewInputBudget
+			}
+			if opts.MaxInputTokens == 0 || opts.MaxInputTokens > limit {
+				opts.MaxInputTokens = limit
+			}
+		}
 	}
-	return invokeAgent(parent, timeout, func(ctx context.Context) (*agent.Result, error) {
+	result, err := invokeAgent(parent, timeout, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
 			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
 		}
@@ -68,6 +103,49 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		}
 		return ag.Run(ctx, opts)
 	})
+	if err != nil {
+		return nil, err
+	}
+	if opts.MaxInputTokens > 0 && result != nil && result.UsageReported {
+		used := invocationInputTokens(ag.Name(), result.Usage)
+		if used > opts.MaxInputTokens {
+			return nil, fmt.Errorf("%w: call consumed %d of %d input tokens", agent.ErrInputTokenBudget, used, opts.MaxInputTokens)
+		}
+	}
+	return result, nil
+}
+
+func invocationInputTokens(name string, usage agent.TokenUsage) int {
+	if name == "claude" {
+		return usage.InputTokens + usage.CacheReadTokens + usage.CacheCreationTokens
+	}
+	return usage.InputTokens + usage.CacheCreationTokens
+}
+
+func (sctx *StepContext) recordedRunInputTokens() (int, error) {
+	rows, err := sctx.DB.GetAgentInvocationsByRun(sctx.Run.ID)
+	if err != nil {
+		return 0, fmt.Errorf("read run input-token usage: %w", err)
+	}
+	total := 0
+	for _, row := range rows {
+		if row.Agent == "claude" {
+			total += perRoundInput(row) + row.CacheReadTokens
+		} else {
+			total += perRoundInput(row)
+		}
+		if row.CacheCreationTokens != nil {
+			total += *row.CacheCreationTokens
+		}
+	}
+	return total, nil
+}
+
+func perRoundInput(row db.AgentInvocation) int {
+	if row.DeltaInputTokens != nil {
+		return *row.DeltaInputTokens
+	}
+	return row.InputTokens
 }
 
 func invokeAgent(parent context.Context, timeout time.Duration, run func(context.Context) (*agent.Result, error)) (*agent.Result, error) {

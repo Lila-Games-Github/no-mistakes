@@ -25,6 +25,12 @@ type Agent interface {
 // RunOpts configures a single agent invocation.
 type RunOpts struct {
 	Prompt string
+	// MaxInputTokens stops an invocation once reported provider input usage
+	// exceeds this limit. Zero disables the limit.
+	MaxInputTokens int
+	// PreparedContext uses the pipeline's bounded brief and asks native adapters
+	// to keep their tool and skill catalogs small when they support that switch.
+	PreparedContext bool
 	// Model overrides the configured model for this invocation when supported.
 	Model string
 	// Env appends invocation-scoped environment entries to the agent process.

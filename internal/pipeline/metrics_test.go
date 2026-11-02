@@ -22,7 +22,9 @@ type metricsAgent struct{}
 func (*metricsAgent) Name() string { return "fake" }
 func (*metricsAgent) Close() error { return nil }
 func (*metricsAgent) Run(context.Context, agent.RunOpts) (*agent.Result, error) {
-	return &agent.Result{Text: "PRIVATE-RESPONSE"}, nil
+	return &agent.Result{Text: "PRIVATE-RESPONSE", UsageReported: true,
+		Usage:   agent.TokenUsage{InputTokens: 123, OutputTokens: 7, Reported: true},
+		Metrics: &agent.InvocationMetrics{ModelRoundtrips: 2}}, nil
 }
 
 func TestExecutorMetricsRetainsFixGateAndCIRevalidation(t *testing.T) {
@@ -69,6 +71,9 @@ func TestExecutorMetricsRetainsFixGateAndCIRevalidation(t *testing.T) {
 	}
 	if !a.CollectionComplete || a.SchemaVersion != 1 || len(a.Invocations) != 3 {
 		t.Fatalf("artifact: %+v", a)
+	}
+	if a.RunUsage.InputTokens == nil || *a.RunUsage.InputTokens != 369 || a.RunUsage.OutputTokens == nil || *a.RunUsage.OutputTokens != 21 || a.RunUsage.ModelRoundtrips == nil || *a.RunUsage.ModelRoundtrips != 6 || len(a.StepUsage) != 1 || a.StepUsage[0].Step != "review" {
+		t.Fatalf("usage totals: run=%+v steps=%+v", a.RunUsage, a.StepUsage)
 	}
 	if len(a.Rounds) != 5 || a.Rounds[0].ReviewMaxPasses != 3 || a.Rounds[0].ReviewScope != "full" || a.Rounds[0].ReviewModel != "configured" || a.Rounds[1].ReviewScope != "delta" || a.Rounds[2].ReviewScope != "delta" {
 		t.Fatalf("review receipt rounds: %+v", a.Rounds)
@@ -156,6 +161,69 @@ func TestReviewLimitParksAfterCIRestartWithoutThirdPass(t *testing.T) {
 	rounds, err := d.GetRoundsByStep(steps[0].ID)
 	if err != nil || len(rounds) != 2 {
 		t.Fatalf("review rounds=%d, err=%v", len(rounds), err)
+	}
+}
+
+func TestReviewLimitNamedFinalFixContinuesWithoutReviewerAndRecordsException(t *testing.T) {
+	d, p, run, repo := setupTest(t)
+	reviewCalls, ciCalls := 0, 0
+	review := &adaptiveCallStep{name: types.StepReview, fn: func(sctx *StepContext) (*StepOutcome, error) {
+		reviewCalls++
+		if sctx.FinalFixWithoutReview {
+			if !sctx.Fixing || !strings.Contains(sctx.PreviousFindings, "remaining concern") {
+				t.Fatalf("final fixer lost selected finding: %+v", sctx)
+			}
+			return &StepOutcome{FixSummary: "resolve named concern", ReviewApprovedHeadSHA: run.HeadSHA, FinalFixUnreviewed: true}, nil
+		}
+		if reviewCalls > 2 {
+			t.Fatal("reviewer called beyond pass cap")
+		}
+		action := "no-op"
+		if reviewCalls == 1 {
+			action = "ask-user"
+		}
+		findings := fmt.Sprintf(`{"findings":[{"id":"review-1","severity":"warning","action":%q,"description":"remaining concern"}],"summary":"remaining concern"}`, action)
+		return &StepOutcome{NeedsApproval: reviewCalls == 1, Findings: findings, ReviewApprovedHeadSHA: run.HeadSHA}, nil
+	}}
+	ci := &adaptiveCallStep{name: types.StepCI, fn: func(*StepContext) (*StepOutcome, error) {
+		ciCalls++
+		if ciCalls == 1 {
+			return &StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+	var executor *Executor
+	executor = NewExecutor(d, p, nil, nil, []Step{review, ci}, func(event ipc.Event) {
+		if event.Status == nil || *event.Status != string(types.StepStatusAwaitingApproval) {
+			return
+		}
+		if event.Findings != nil && strings.Contains(*event.Findings, "Review pass limit reached") {
+			if err := executor.Respond(types.StepReview, types.ActionFixFinal, []string{"review-1"}); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		if err := executor.Respond(types.StepReview, types.ActionFix, []string{"review-1"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := executor.Execute(context.Background(), run, repo, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if reviewCalls != 3 || ciCalls != 2 {
+		t.Fatalf("review calls=%d (last fixer-only), CI calls=%d", reviewCalls, ciCalls)
+	}
+	steps, err := d.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rounds, err := d.GetRoundsByStep(steps[0].ID)
+	if err != nil || len(rounds) != 3 || rounds[2].Trigger != "final_fix_unreviewed" || rounds[2].ReviewedHeadSHA != nil {
+		t.Fatalf("final fix round = %+v, error=%v", rounds, err)
+	}
+	artifact, err := runmetrics.Build(d, run.ID, p.RunLogDir(run.ID), time.Now())
+	if err != nil || !artifact.UnreviewedFinalFix {
+		t.Fatalf("receipt omitted unreviewed final fix: %+v, %v", artifact, err)
 	}
 }
 

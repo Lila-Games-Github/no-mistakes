@@ -101,6 +101,13 @@ Previous test findings to address:
 	}
 
 	testCmd := sctx.Config.Commands.Test
+	if testCmd == "" {
+		planned, err := sctx.PlannedTestCommand(ctx)
+		if err != nil {
+			return nil, err
+		}
+		testCmd = planned
+	}
 	tested := []string{}
 	if testCmd != "" {
 		sctx.Log(fmt.Sprintf("running tests: %s", testCmd))
@@ -132,7 +139,7 @@ Previous test findings to address:
 		}
 	}
 
-	useEvidenceAgent := testCmd == "" || cleanedUserIntent(sctx) != ""
+	useEvidenceAgent := testCmd == "" || (cleanedUserIntent(sctx) != "" && !sctx.Config.ContextBrief)
 	if useEvidenceAgent {
 		evidenceDir := testEvidenceDir(sctx)
 		if evidenceDir == "" {

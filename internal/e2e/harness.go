@@ -44,6 +44,7 @@ type Harness struct {
 
 	agentName         string // claude / codex / grok / opencode / antigravity
 	allowRepoCommands *bool  // mirrors SetupOpts.AllowRepoCommands
+	contextBrief      bool   // explicit prepared-context coverage; legacy fixtures opt out
 	daemonOwn         *e2edaemon.Ownership
 }
 
@@ -68,6 +69,9 @@ type SetupOpts struct {
 	// (commands must come from the trusted default branch) pass a pointer
 	// to false to exercise the secure default.
 	AllowRepoCommands *bool
+	// ContextBrief opts a journey into the prepared-context pipeline. Most
+	// historical journeys assert legacy prompt and adapter behavior explicitly.
+	ContextBrief bool
 }
 
 const e2eDaemonStartTimeout = "45s"
@@ -102,6 +106,7 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 		Scenario:          opts.Scenario,
 		agentName:         opts.Agent,
 		allowRepoCommands: opts.AllowRepoCommands,
+		contextBrief:      opts.ContextBrief,
 	}
 
 	for _, dir := range []string{h.BinDir, h.NMHome, h.HomeDir, h.WorkDir} {
@@ -203,6 +208,7 @@ func (h *Harness) writeGlobalConfig() {
 	binLink := filepath.Join(h.BinDir, h.agentName)
 	cfg := fmt.Sprintf(`agent: %s
 log_level: debug
+context_brief: %t
 agent_path_override:
   %s: %s
 auto_fix:
@@ -212,7 +218,7 @@ auto_fix:
   review: 0
   document: 0
   ci: 0
-`, h.agentName, h.agentName, binLink)
+`, h.agentName, h.contextBrief, h.agentName, binLink)
 	if err := os.WriteFile(configPath, []byte(cfg), 0o644); err != nil {
 		h.t.Fatalf("write config: %v", err)
 	}

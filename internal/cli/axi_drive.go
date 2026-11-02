@@ -733,7 +733,7 @@ func newAxiRespondCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "respond",
 		Short: "Answer the current approval gate and continue the run",
-		Long: "Sends approve/fix/skip for the step currently awaiting approval, then\n" +
+		Long: "Sends approve/fix/fix-final/skip for the step currently awaiting approval, then\n" +
 			"blocks until the next gate, CI-ready decision point, or final outcome.\n\n" +
 			preserveGateFixCommitsGuidance,
 		Args:          cobra.NoArgs,
@@ -755,9 +755,9 @@ func newAxiRespondCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().StringVar(&action, "action", "", "approve | fix | skip (required)")
+	cmd.Flags().StringVar(&action, "action", "", "approve | fix | fix-final | skip (required)")
 	cmd.Flags().StringVar(&step, "step", "", "step to respond to (default: the step awaiting approval)")
-	cmd.Flags().StringVar(&findings, "findings", "", "comma-separated finding IDs to fix (with --action fix)")
+	cmd.Flags().StringVar(&findings, "findings", "", "comma-separated finding IDs to fix (with --action fix or fix-final)")
 	cmd.Flags().StringVar(&instructions, "instructions", "", "guidance applied to the selected findings (with --action fix)")
 	cmd.Flags().StringVar(&addFinding, "add-finding", "", "JSON finding object to add and fix (with --action fix)")
 	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve every subsequent gate until a decision point or outcome")
@@ -778,13 +778,13 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 
 	act := types.ApprovalAction(strings.TrimSpace(ra.action))
 	switch act {
-	case types.ActionApprove, types.ActionFix, types.ActionSkip:
+	case types.ActionApprove, types.ActionFix, types.ActionFixFinal, types.ActionSkip:
 	case "":
 		return emitError(cmd, 2, "--action is required",
-			"Run `no-mistakes axi respond --action approve|fix|skip`")
+			"Run `no-mistakes axi respond --action approve|fix|fix-final|skip`")
 	default:
 		return emitError(cmd, 2, fmt.Sprintf("unknown action %q", ra.action),
-			"Valid actions: approve, fix, skip")
+			"Valid actions: approve, fix, fix-final, skip")
 	}
 
 	env, err := openAxiDaemonEnv()
@@ -827,9 +827,9 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 	var instructions map[string]string
 	var added []types.Finding
 
-	if act == types.ActionFix {
+	if act == types.ActionFix || act == types.ActionFixFinal {
 		if len(findingIDs) == 0 && ra.addFinding == "" {
-			return emitError(cmd, 2, "--action fix requires --findings <id,...> or --add-finding <json>",
+			return emitError(cmd, 2, "fix and fix-final require --findings <id,...> or --add-finding <json>",
 				"Run `no-mistakes axi status` to list finding IDs")
 		}
 		if note := strings.TrimSpace(ra.instructions); note != "" && len(findingIDs) > 0 {

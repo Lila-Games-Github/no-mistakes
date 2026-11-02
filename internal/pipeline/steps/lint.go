@@ -22,6 +22,13 @@ func (s *LintStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	ctx := sctx.Ctx
 	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, runTargetBranch(sctx))
 	lintCmd := sctx.Config.Commands.Lint
+	if lintCmd == "" {
+		planned, err := sctx.PlannedLintCommand(ctx)
+		if err != nil {
+			return nil, err
+		}
+		lintCmd = planned
+	}
 
 	if lintCmd == "" {
 		// The combined document+lint housekeeping pass already performed the

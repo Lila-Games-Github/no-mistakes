@@ -285,6 +285,7 @@ func configureRecursiveIncidentAdapter(t *testing.T, h *Harness, agentName, exec
 	}
 	config := fmt.Sprintf(`agent: %s
 log_level: debug
+context_brief: false
 acpx_path: %s
 auto_fix:
   rebase: 0

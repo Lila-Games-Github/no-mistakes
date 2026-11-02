@@ -28,6 +28,7 @@ type StepContext struct {
 	LogFile               func(string) // file-only log callback (not shown to user)
 	Fixing                bool         // true when re-executing after a "fix" action
 	SkipFixExecution      bool         // replay an already-completed fix round's review turn only
+	FinalFixWithoutReview bool         // explicit user choice at the review pass cap
 	ReviewStartingHeadSHA string
 	ReviewPreviousHeadSHA string // head examined by the preceding review pass
 	ReviewPass            int
@@ -37,6 +38,7 @@ type StepContext struct {
 	// StepResultID is the DB row ID of the current step's step_results record.
 	// Steps use it to query their own round history for multi-round prompts.
 	StepResultID string
+	StepName     types.StepName
 	// EvidenceDir is where this run's test-evidence artifacts belong, always
 	// outside the worktree. The executor resolves it once from the app root
 	// (honoring test.evidence.local_root) so every consumer - the test step's
@@ -47,7 +49,9 @@ type StepContext struct {
 	// (<NM_HOME>/runbooks/<repoID>), never inside the repository. Empty
 	// disables persistence; the run-book is then rebuilt per turn.
 	RunbookDir string
-	Env        []string // extra environment variables for subprocesses (used in tests)
+	// BriefDir holds the run's fixed context prefix for recovery.
+	BriefDir string
+	Env      []string // extra environment variables for subprocesses (used in tests)
 	// UserIntent is a short, possibly-empty summary of what the change author
 	// was trying to accomplish. It's surfaced in step prompts so agents have
 	// context beyond the diff. Its authority depends on IntentSource: an
@@ -125,6 +129,7 @@ type StepOutcome struct {
 	ReviewApprovedHeadSHA string
 	ReviewModel           string
 	ReviewScope           string
+	FinalFixUnreviewed    bool
 
 	// DurationOverrideMS, when positive, replaces the wall-clock duration
 	// reported for this step. Used by demo mode to show realistic durations

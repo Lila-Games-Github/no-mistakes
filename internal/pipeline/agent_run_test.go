@@ -10,8 +10,41 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestRunAgent_StopsAtReviewAndRunInputBudgets(t *testing.T) {
+	database, _, run, _ := setupTest(t)
+	used := 1_300_000
+	if _, err := database.InsertAgentInvocation(db.AgentInvocation{
+		RunID: run.ID, StepName: "review", Round: 1, Purpose: "review", Agent: "claude",
+		SessionMode: db.InvocationModeCold, StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok",
+		DeltaInputTokens: &used,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var limit int
+	ag := &hangingAgent{name: "claude", runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		limit = opts.MaxInputTokens
+		return &agent.Result{Text: "ok", UsageReported: true, Usage: agent.TokenUsage{InputTokens: limit + 1, Reported: true}}, nil
+	}}
+	sctx := &StepContext{Ctx: context.Background(), DB: database, Run: run, Agent: ag,
+		Config: &config.Config{ContextBrief: true}, Shared: &RunShared{contextBrief: "fixed brief"}, StepName: types.StepReview}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "review"}); !errors.Is(err, agent.ErrInputTokenBudget) {
+		t.Fatalf("over-budget result error = %v", err)
+	}
+	if limit != defaultReviewInputBudget {
+		t.Fatalf("review budget = %d, want %d", limit, defaultReviewInputBudget)
+	}
+	sctx.StepName = types.StepTest
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "test"}); !errors.Is(err, agent.ErrInputTokenBudget) {
+		t.Fatalf("run-budget result error = %v", err)
+	}
+	if limit != 200_000 {
+		t.Fatalf("remaining run budget = %d, want 200000", limit)
+	}
+}
 
 type hangingAgent struct {
 	name    string

@@ -385,6 +385,26 @@ func TestTestStep_UserIntentRunsConfiguredCommandThenEvidenceAgent(t *testing.T)
 	}
 }
 
+func TestTestStep_ContextBriefRunsPlainCommandWithoutSuccessAgent(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	called := false
+	ag := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		called = true
+		t.Fatal("success path launched a test agent")
+		return nil, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{Test: "go env GOOS"})
+	sctx.Config.ContextBrief = true
+	sctx.UserIntent = "Confirm the feature works"
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err != nil || outcome.NeedsApproval || called {
+		t.Fatalf("plain command test outcome=%+v, called=%t, err=%v", outcome, called, err)
+	}
+	if !strings.Contains(outcome.Findings, "go env GOOS") {
+		t.Fatalf("receipt omitted command: %s", outcome.Findings)
+	}
+}
+
 func TestTestStep_EvidenceDirectoryIsAlwaysOutsideTheWorktree(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

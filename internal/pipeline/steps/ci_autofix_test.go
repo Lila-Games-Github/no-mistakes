@@ -239,7 +239,7 @@ func TestCIStep_CIAutoFixLimitExhausted(t *testing.T) {
 	sctx.Repo.UpstreamURL = upstream
 	sctx.Run.Branch = "refs/heads/feature"
 	sctx.Config.CITimeout = 30 * time.Second
-	sctx.Config.AutoFix = config.AutoFix{CI: 1} // only 1 attempt allowed
+	sctx.Config.AutoFix.CI = config.Merge(config.DefaultGlobalConfig(), &config.RepoConfig{}).AutoFix.CI // default: one repair round
 	stepResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepCI)
 	if err != nil {
 		t.Fatal(err)

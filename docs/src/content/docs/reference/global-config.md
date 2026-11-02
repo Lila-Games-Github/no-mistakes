@@ -54,6 +54,8 @@ log_level: info
 
 session_reuse: true
 
+context_brief: true
+
 lean_turns:
   agents: [pi]
   runbook: true
@@ -79,7 +81,7 @@ auto_fix:
   test: 3
   document: 3
   lint: 3
-  ci: 3
+  ci: 1
 
 ci:
   rerun_transient: 0
@@ -496,6 +498,17 @@ Session identities are persisted only as minimum local resume metadata, never as
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
 Set `false` to force every agent invocation cold.
 
+### context_brief
+
+| | |
+| --- | --- |
+| Type | `bool` |
+| Default | `true` |
+
+Builds a bounded change brief at the first agent invocation and stores it under the run's local log directory. Each step receives the same prefix: the initial diff, short changed-file excerpts, only trusted `review.path_instructions` matching changed paths, covering tests found by path, and configured or focused validation commands. A short outcomes log follows the stable prefix. Review turns remain fresh and independent; the log contains findings and fix summaries rather than an author's private reasoning.
+
+The default also suppresses repository agent instructions for gate agents, runs discovered focused test and lint commands directly where available, limits a run to 1.5 million reported input tokens and each review invocation to 150 thousand, and stops an over-budget Claude invocation from its event stream. Prepared Claude calls use `--safe-mode` to omit user and project customizations while retaining authentication and use the Bash tool alone unless `agent_args_override` pins `--tools`. A repo can still set `disable_project_settings: true` on its trusted default branch when this option is off. Set `context_brief: false` globally to restore the previous prompt and agent behavior. Unsupported agent backends fail closed if they cannot verify project-instruction suppression.
+
 ### lean_turns
 
 Turn-economy measures for harnesses that otherwise re-explore the repository and re-review the whole change on every turn. They apply only to the agents listed in `lean_turns.agents`; every other agent keeps its exact previous behavior. With an ordered `agent` fallback list, the first agent decides.
@@ -569,7 +582,7 @@ For empty `commands.lint`, the document step's combined housekeeping pass also a
 | `auto_fix.test`     | `int` | `3`     | Test failure auto-fix attempts                                                              |
 | `auto_fix.document` | `int` | `3`     | Not used by the automatic document pass                                                     |
 | `auto_fix.lint`     | `int` | `3`     | Lint issue auto-fix attempts                                                                |
-| `auto_fix.ci`       | `int` | `3`     | CI auto-fix attempts for CI failures, plus GitHub, GitLab, Forgejo, and Azure DevOps merge conflicts |
+| `auto_fix.ci`       | `int` | `1`     | CI auto-fix attempts for CI failures, plus GitHub, GitLab, Forgejo, and Azure DevOps merge conflicts |
 
 Legacy alias: `auto_fix.babysit`.
 

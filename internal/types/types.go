@@ -145,10 +145,11 @@ const (
 type ApprovalAction string
 
 const (
-	ActionApprove ApprovalAction = "approve"
-	ActionFix     ApprovalAction = "fix"
-	ActionSkip    ApprovalAction = "skip"
-	ActionAbort   ApprovalAction = "abort"
+	ActionApprove  ApprovalAction = "approve"
+	ActionFix      ApprovalAction = "fix"
+	ActionFixFinal ApprovalAction = "fix-final"
+	ActionSkip     ApprovalAction = "skip"
+	ActionAbort    ApprovalAction = "abort"
 )
 
 // AgentName identifies a supported agent backend. Explicit ACP targets use
