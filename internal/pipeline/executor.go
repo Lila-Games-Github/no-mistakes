@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -61,12 +62,13 @@ type Executor struct {
 	shared   *RunShared
 	workDir  string
 
-	mu           sync.Mutex
-	approvalCh   chan approvalResponse // buffered channel for approval responses
-	waiting      bool                  // true when blocked on approval
-	waitingStep  types.StepName        // which step is currently awaiting approval
-	waitingRunID string                // run whose gate is awaiting approval
-	recovering   bool                  // recovered remainder honors stored skipped steps
+	mu                 sync.Mutex
+	approvalCh         chan approvalResponse // buffered channel for approval responses
+	waiting            bool                  // true when blocked on approval
+	waitingStep        types.StepName        // which step is currently awaiting approval
+	waitingRunID       string                // run whose gate is awaiting approval
+	waitingReviewLimit bool                  // further review passes are forbidden
+	recovering         bool                  // recovered remainder honors stored skipped steps
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -162,6 +164,13 @@ func (e *Executor) Respond(step types.StepName, action types.ApprovalAction, fin
 	return e.RespondWithOverrides(step, action, findingIDs, nil, nil)
 }
 
+func (e *Executor) reviewPassLimit() int {
+	if e.config == nil {
+		return 2
+	}
+	return e.config.Review.ReviewPassLimit()
+}
+
 // RespondWithOverrides is like Respond but also carries per-finding user
 // instructions and user-authored findings. Both are merged into the round's
 // findings on a fix action before the fix agent runs.
@@ -174,6 +183,10 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 	if step != e.waitingStep {
 		e.mu.Unlock()
 		return fmt.Errorf("step mismatch: responding to %q but %q is awaiting approval", step, e.waitingStep)
+	}
+	if step == types.StepReview && action == types.ActionFix && e.waitingReviewLimit {
+		e.mu.Unlock()
+		return fmt.Errorf("review pass limit reached (%d): approve or abort the remaining findings; a third review pass cannot start", e.reviewPassLimit())
 	}
 	if step == types.StepReview && action == types.ActionSkip && !e.skips[types.StepPush] {
 		// Recovery has no in-memory skip list. A Push step already marked
@@ -198,6 +211,7 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 	}
 	e.waiting = false
 	e.waitingRunID = ""
+	e.waitingReviewLimit = false
 	e.mu.Unlock()
 
 	e.approvalCh <- approvalResponse{
@@ -327,12 +341,15 @@ func (e *Executor) initializeRunScopes(runID string) {
 }
 
 type stepExecutionState struct {
-	fixing           bool
-	previousFindings string
-	roundNum         int
-	autoFixAttempts  int
-	executionMS      int64
-	currentRoundID   string
+	fixing               bool
+	previousFindings     string
+	roundNum             int
+	autoFixAttempts      int
+	executionMS          int64
+	currentRoundID       string
+	previousReviewedHead string
+	previousRisk         string
+	lastFindings         string
 }
 
 func (e *Executor) durableExecutionState(stepResultID string) (stepExecutionState, error) {
@@ -345,6 +362,16 @@ func (e *Executor) durableExecutionState(stepResultID string) (stepExecutionStat
 		state.roundNum = max(state.roundNum, round.Round)
 		if round.SelectionSource != nil && *round.SelectionSource == db.RoundSelectionSourceAutoFix {
 			state.autoFixAttempts++
+		}
+		if round.ReviewedHeadSHA != nil {
+			state.previousReviewedHead = *round.ReviewedHeadSHA
+		}
+		if round.FindingsJSON != nil {
+			state.lastFindings = *round.FindingsJSON
+			var findings types.Findings
+			if json.Unmarshal([]byte(*round.FindingsJSON), &findings) == nil {
+				state.previousRisk = findings.RiskLevel
+			}
 		}
 	}
 	return state, nil
@@ -459,6 +486,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
 	e.waitingRunID = run.ID
+	e.waitingReviewLimit = gate.step.Name() == types.StepReview && gate.round >= e.reviewPassLimit()
 	e.mu.Unlock()
 	e.emitStepEventWithFindingsAndError(
 		ipc.EventStepCompleted,
@@ -541,12 +569,14 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		}
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFixing), "", "", nil)
 		skipRemaining, restartFrom, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
-			fixing:           true,
-			previousFindings: merged,
-			roundNum:         gate.round,
-			autoFixAttempts:  gate.autoFixes,
-			executionMS:      duration,
-			currentRoundID:   gate.lastRoundID,
+			fixing:               true,
+			previousFindings:     merged,
+			roundNum:             gate.round,
+			previousReviewedHead: gate.reviewedHeadSHA,
+			previousRisk:         reviewRiskFromFindings(gate.findings),
+			autoFixAttempts:      gate.autoFixes,
+			executionMS:          duration,
+			currentRoundID:       gate.lastRoundID,
 		})
 		if err != nil {
 			return e.failRun(run, repo, err, ctx)
@@ -565,6 +595,14 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	default:
 		return e.failRun(run, repo, fmt.Errorf("step %s: unsupported approval action %q", gate.step.Name(), response.action), ctx)
 	}
+}
+
+func reviewRiskFromFindings(raw string) string {
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return ""
+	}
+	return findings.RiskLevel
 }
 
 func (e *Executor) runContext(ctx context.Context) context.Context {
@@ -598,7 +636,10 @@ func (e *Executor) recoveredGate(runID string) (*recoveredGate, error) {
 			}
 			latest := rounds[len(rounds)-1]
 			if latest.FindingsJSON == nil || *latest.FindingsJSON != *result.FindingsJSON {
-				return nil, fmt.Errorf("recovered approval gate findings are incomplete")
+				findings, parseErr := types.ParseFindingsJSON(*result.FindingsJSON)
+				if result.StepName != types.StepReview || parseErr != nil || findings.ReviewScope != "escalation" || latest.Round < e.reviewPassLimit() {
+					return nil, fmt.Errorf("recovered approval gate findings are incomplete")
+				}
 			}
 			autoFixes := 0
 			for _, round := range rounds {
@@ -617,6 +658,13 @@ func (e *Executor) recoveredGate(runID string) (*recoveredGate, error) {
 			}
 			if latest.ReviewedHeadSHA != nil {
 				gate.reviewedHeadSHA = *latest.ReviewedHeadSHA
+			}
+			if findings, parseErr := types.ParseFindingsJSON(*result.FindingsJSON); parseErr == nil && findings.ReviewScope == "escalation" {
+				parkedRun, runErr := e.db.GetRun(runID)
+				if runErr != nil {
+					return nil, fmt.Errorf("recover review escalation head: %w", runErr)
+				}
+				gate.reviewedHeadSHA = parkedRun.HeadSHA
 			}
 			continue
 		}
@@ -900,18 +948,50 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	// Execute with possible fix loop
 	for {
+		limitReached := stepName == types.StepReview && roundNum >= e.reviewPassLimit()
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
-		sctx.Ctx = runmetrics.BeginContext(runmetrics.Scope(sctx.Ctx, string(stepName), roundNum+1))
-		finishCycle := runmetrics.Start(sctx.Ctx, runmetrics.Cycle)
-		outcome, err := step.Execute(sctx)
-		var cycleExit *int
-		if outcome != nil {
-			code := outcome.ExitCode
-			cycleExit = &code
+		sctx.ReviewPreviousHeadSHA = state.previousReviewedHead
+		sctx.ReviewPass = roundNum + 1
+		sctx.ReviewPreviousRisk = state.previousRisk
+		var outcome *StepOutcome
+		var err error
+		if limitReached {
+			// A late CI repair can restart validation after the final review
+			// pass. Park an explicit gate without invoking another reviewer or
+			// inventing a third round in the receipt.
+			findings, parseErr := types.ParseFindingsJSON(state.lastFindings)
+			if parseErr != nil {
+				findings = types.Findings{}
+			}
+			findings.Items = append(findings.Items, types.Finding{
+				ID:          "review-pass-limit",
+				Severity:    "warning",
+				Action:      string(types.ActionAskUser),
+				Description: "Changes made after the final review pass have not been reviewed; approve or abort this run.",
+				ReviewScope: types.FindingReviewScopeSource,
+			})
+			findings.Summary = fmt.Sprintf("Review pass limit reached (%d). Remaining findings require approval or abort; no further review pass can start. %s", e.reviewPassLimit(), findings.Summary)
+			findings.ReviewMaxPasses = e.reviewPassLimit()
+			findings.ReviewScope = "escalation"
+			findings.ReviewModel = "none"
+			encoded, marshalErr := types.MarshalFindingsJSON(findings)
+			if marshalErr != nil {
+				return false, "", marshalErr
+			}
+			outcome = &StepOutcome{NeedsApproval: true, Findings: encoded, ReviewApprovedHeadSHA: run.HeadSHA}
+		} else {
+			sctx.Ctx = runmetrics.BeginContext(runmetrics.Scope(sctx.Ctx, string(stepName), roundNum+1))
+			finishCycle := runmetrics.Start(sctx.Ctx, runmetrics.Cycle)
+			outcome, err = step.Execute(sctx)
+			var cycleExit *int
+			if outcome != nil {
+				code := outcome.ExitCode
+				cycleExit = &code
+			}
+			finishCycle(err, cycleExit, runmetrics.Input{})
+			roundNum++
 		}
-		finishCycle(err, cycleExit, runmetrics.Input{})
-		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
 		if err != nil {
 			durationMS := executionMS + roundDuration
@@ -932,10 +1012,47 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		}
 		restartFrom = outcome.RestartFrom
 
-		if stepName == types.StepReview {
+		if stepName == types.StepReview && !limitReached {
 			reviewApprovedHeadSHA = outcome.ReviewApprovedHeadSHA
+			state.previousReviewedHead = reviewApprovedHeadSHA
+			var reviewFindings types.Findings
+			if json.Unmarshal([]byte(outcome.Findings), &reviewFindings) == nil {
+				state.previousRisk = reviewFindings.RiskLevel
+			}
 		}
 		outcome.Findings = normalizeFindingsJSON(outcome.Findings, string(stepName))
+		if limitReached {
+			reviewApprovedHeadSHA = outcome.ReviewApprovedHeadSHA
+		}
+		if stepName == types.StepReview && roundNum >= e.reviewPassLimit() && outcome.AutoFixable && autoFixableFindingsJSON(outcome.Findings) != "" {
+			outcome.NeedsApproval = true
+		}
+		if stepName == types.StepReview {
+			if findings, parseErr := types.ParseFindingsJSON(outcome.Findings); parseErr == nil {
+				findings.ReviewMaxPasses = e.reviewPassLimit()
+				if !limitReached {
+					findings.ReviewScope = "full"
+					if sctx.ReviewPass > 1 {
+						findings.ReviewScope = "delta"
+					}
+					findings.ReviewModel = "configured"
+					if e.config != nil && sctx.Agent != nil {
+						if model := e.config.AgentProfileFor(types.AgentName(sctx.Agent.Name())).Model; model != "" {
+							findings.ReviewModel = model
+						}
+					}
+					if sctx.ReviewModel != "" {
+						findings.ReviewModel = sctx.ReviewModel
+					}
+				}
+				if !limitReached && roundNum >= e.reviewPassLimit() && outcome.NeedsApproval {
+					findings.Summary = fmt.Sprintf("Review pass limit reached (%d). Remaining findings require approval or abort; no further fix and review pass can start. %s", e.reviewPassLimit(), findings.Summary)
+				}
+				if encoded, marshalErr := types.MarshalFindingsJSON(findings); marshalErr == nil {
+					outcome.Findings = encoded
+				}
+			}
+		}
 		finalExitCode = outcome.ExitCode
 		durationOverrideMS += outcome.DurationOverrideMS
 
@@ -965,7 +1082,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		if stepName == types.StepCI && restartFrom != "" && !sctx.Fixing {
 			roundTrigger = "auto_fix"
 		}
-		if stepName == types.StepReview {
+		if limitReached {
+			inserted = nil
+		} else if stepName == types.StepReview {
 			if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
 			} else {
@@ -974,7 +1093,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		} else {
 			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		}
-		if dbErr != nil {
+		if limitReached {
+			// Keep the last real review round as the gate's durable decision.
+		} else if dbErr != nil {
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)
 			slog.Warn("failed to insert step round", "step", stepName, "round", roundNum, "error", dbErr)
 		} else {
@@ -991,7 +1112,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		// Only auto-fix findings whose action is "auto-fix".
 		// This runs before the NeedsApproval check so that all severity
 		// levels (including "info") get a chance at automatic fixing.
-		if outcome.AutoFixable && autoFixLimit > 0 && autoFixAttempts < autoFixLimit {
+		if outcome.AutoFixable && autoFixLimit > 0 && autoFixAttempts < autoFixLimit && (stepName != types.StepReview || roundNum < e.reviewPassLimit()) {
 			fixableFindings := autoFixableFindingsJSON(outcome.Findings)
 			if fixableFindings != "" {
 				autoFixAttempts++
@@ -1049,6 +1170,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		e.waiting = true
 		e.waitingStep = stepName
 		e.waitingRunID = run.ID
+		e.waitingReviewLimit = stepName == types.StepReview && roundNum >= e.reviewPassLimit()
 		e.mu.Unlock()
 
 		// Parking starts before the gate becomes observable. This includes the

@@ -130,26 +130,32 @@ type findingWire struct {
 
 // Findings is the structured findings payload exchanged across pipeline, IPC, and TUI.
 type Findings struct {
-	Items          []Finding      `json:"findings"`
-	Summary        string         `json:"summary"`
-	Tested         []string       `json:"tested,omitempty"`
-	TestingSummary string         `json:"testing_summary,omitempty"`
-	Artifacts      []TestArtifact `json:"artifacts,omitempty"`
-	RiskLevel      string         `json:"risk_level"`
-	RiskRationale  string         `json:"risk_rationale"`
-	RiskScope      string         `json:"risk_scope,omitempty"`
+	Items           []Finding      `json:"findings"`
+	Summary         string         `json:"summary"`
+	Tested          []string       `json:"tested,omitempty"`
+	TestingSummary  string         `json:"testing_summary,omitempty"`
+	Artifacts       []TestArtifact `json:"artifacts,omitempty"`
+	RiskLevel       string         `json:"risk_level"`
+	RiskRationale   string         `json:"risk_rationale"`
+	RiskScope       string         `json:"risk_scope,omitempty"`
+	ReviewMaxPasses int            `json:"review_max_passes,omitempty"`
+	ReviewScope     string         `json:"review_scope,omitempty"`
+	ReviewModel     string         `json:"review_model,omitempty"`
 }
 
 type findingsWire struct {
-	Items          []Finding      `json:"findings"`
-	Legacy         []Finding      `json:"items"`
-	Summary        string         `json:"summary"`
-	Tested         []string       `json:"tested"`
-	TestingSummary string         `json:"testing_summary"`
-	Artifacts      []TestArtifact `json:"artifacts"`
-	RiskLevel      string         `json:"risk_level"`
-	RiskRationale  string         `json:"risk_rationale"`
-	RiskScope      string         `json:"risk_scope"`
+	Items           []Finding      `json:"findings"`
+	Legacy          []Finding      `json:"items"`
+	Summary         string         `json:"summary"`
+	Tested          []string       `json:"tested"`
+	TestingSummary  string         `json:"testing_summary"`
+	Artifacts       []TestArtifact `json:"artifacts"`
+	RiskLevel       string         `json:"risk_level"`
+	RiskRationale   string         `json:"risk_rationale"`
+	RiskScope       string         `json:"risk_scope"`
+	ReviewMaxPasses int            `json:"review_max_passes"`
+	ReviewScope     string         `json:"review_scope"`
+	ReviewModel     string         `json:"review_model"`
 }
 
 // ParseFindingsJSON decodes findings JSON, accepting current and legacy item
@@ -163,7 +169,7 @@ func ParseFindingsJSON(raw string) (Findings, error) {
 	if len(items) == 0 && len(wire.Legacy) > 0 {
 		items = wire.Legacy
 	}
-	return Findings{Items: items, Summary: wire.Summary, Tested: wire.Tested, TestingSummary: wire.TestingSummary, Artifacts: wire.Artifacts, RiskLevel: wire.RiskLevel, RiskRationale: wire.RiskRationale, RiskScope: wire.RiskScope}, nil
+	return Findings{Items: items, Summary: wire.Summary, Tested: wire.Tested, TestingSummary: wire.TestingSummary, Artifacts: wire.Artifacts, RiskLevel: wire.RiskLevel, RiskRationale: wire.RiskRationale, RiskScope: wire.RiskScope, ReviewMaxPasses: wire.ReviewMaxPasses, ReviewScope: wire.ReviewScope, ReviewModel: wire.ReviewModel}, nil
 }
 
 // NormalizeFindings assigns deterministic IDs to findings that do not have one yet.

@@ -270,6 +270,7 @@ func runChunkedReview(ctx context.Context, sctx *pipeline.StepContext, basePromp
 		pathRules := reviewPathInstructionsSection(matchPathInstructions(chunk.paths(), sctx.Config.Review.PathInstructions))
 		result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
 			Prompt:     basePrompt + pathRules + chunk.prompt(i+1, len(chunks), diffRange),
+			Model:      sctx.ReviewModel,
 			CWD:        sctx.WorkDir,
 			Env:        sctx.Env,
 			JSONSchema: reviewFindingsSchema,

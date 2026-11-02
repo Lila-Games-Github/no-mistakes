@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -44,7 +46,7 @@ func TestExecutorMetricsRetainsFixGateAndCIRevalidation(t *testing.T) {
 		return &StepOutcome{}, nil
 	}}
 	var executor *Executor
-	executor = NewExecutor(d, p, nil, &metricsAgent{}, []Step{review, ci}, func(event ipc.Event) {
+	executor = NewExecutor(d, p, &config.Config{Review: config.Review{MaxPasses: 3}}, &metricsAgent{}, []Step{review, ci}, func(event ipc.Event) {
 		if event.Status != nil && *event.Status == string(types.StepStatusAwaitingApproval) {
 			if err := executor.Respond(types.StepReview, types.ActionFix, nil); err != nil {
 				t.Fatal(err)
@@ -68,6 +70,9 @@ func TestExecutorMetricsRetainsFixGateAndCIRevalidation(t *testing.T) {
 	if !a.CollectionComplete || a.SchemaVersion != 1 || len(a.Invocations) != 3 {
 		t.Fatalf("artifact: %+v", a)
 	}
+	if len(a.Rounds) != 5 || a.Rounds[0].ReviewMaxPasses != 3 || a.Rounds[0].ReviewScope != "full" || a.Rounds[0].ReviewModel != "configured" || a.Rounds[1].ReviewScope != "delta" || a.Rounds[2].ReviewScope != "delta" {
+		t.Fatalf("review receipt rounds: %+v", a.Rounds)
+	}
 	if a.Phases[0].ExecutionCycles != 3 || a.Phases[0].FixRounds != 1 || a.Phases[1].ExecutionCycles != 2 {
 		t.Fatalf("cycles: %+v", a.Phases)
 	}
@@ -88,6 +93,69 @@ func TestExecutorMetricsRetainsFixGateAndCIRevalidation(t *testing.T) {
 	}
 	if strings.Contains(string(b), "PRIVATE-") {
 		t.Fatal("prompt or response leaked into metrics")
+	}
+}
+
+func TestReviewLimitParksAfterCIRestartWithoutThirdPass(t *testing.T) {
+	d, p, run, repo := setupTest(t)
+	reviews, cis, escalations := 0, 0, 0
+	review := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+		reviews++
+		if reviews > 2 {
+			t.Fatal("third review pass started")
+		}
+		action := "no-op"
+		if reviews == 1 {
+			action = "ask-user"
+		}
+		findings := fmt.Sprintf(`{"findings":[{"id":"review-1","severity":"warning","action":%q,"description":"remaining concern"}],"summary":"remaining concern"}`, action)
+		return &StepOutcome{NeedsApproval: reviews == 1, Findings: findings, ReviewApprovedHeadSHA: run.HeadSHA}, nil
+	}}
+	ci := &adaptiveCallStep{name: types.StepCI, fn: func(*StepContext) (*StepOutcome, error) {
+		cis++
+		if cis == 1 {
+			return &StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+	var executor *Executor
+	executor = NewExecutor(d, p, nil, nil, []Step{review, ci}, func(event ipc.Event) {
+		if event.Status == nil || *event.Status != string(types.StepStatusAwaitingApproval) {
+			return
+		}
+		if event.Findings != nil && strings.Contains(*event.Findings, "Review pass limit reached") {
+			escalations++
+			if !strings.Contains(*event.Findings, "remaining concern") {
+				t.Fatal("escalation lost the remaining finding")
+			}
+			if !strings.Contains(*event.Findings, "Changes made after the final review pass have not been reviewed") {
+				t.Fatal("escalation did not name the unreviewed changes")
+			}
+			if err := executor.Respond(types.StepReview, types.ActionFix, nil); err == nil {
+				t.Fatal("fix accepted after review cap")
+			}
+			if err := executor.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		if err := executor.Respond(types.StepReview, types.ActionFix, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := executor.Execute(context.Background(), run, repo, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if reviews != 2 || cis != 2 || escalations != 1 {
+		t.Fatalf("reviews=%d ci=%d escalation gates=%d", reviews, cis, escalations)
+	}
+	steps, err := d.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rounds, err := d.GetRoundsByStep(steps[0].ID)
+	if err != nil || len(rounds) != 2 {
+		t.Fatalf("review rounds=%d, err=%v", len(rounds), err)
 	}
 }
 

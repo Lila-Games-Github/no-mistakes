@@ -87,6 +87,9 @@ func (a *fallbackAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 	var lastErr error
 	for i, current := range candidates {
 		currentOpts := opts
+		if opts.Model != "" && current.Name() != "claude" && current.Name() != "codex" {
+			return nil, fmt.Errorf("agent %s cannot honor review model override %q", current.Name(), opts.Model)
+		}
 		if currentOpts.Session != nil && currentOpts.Session.ID == "" && !SupportsSessionResume(current) {
 			currentOpts.Session = nil
 			currentOpts.SessionFallback = false

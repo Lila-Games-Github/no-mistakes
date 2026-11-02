@@ -34,7 +34,7 @@ The top-level `schema_version` is `1`. Consumers should check it before interpre
 | `run_id`, `status`, `generated_at` | Local correlation identity, current stored outcome, and UTC snapshot time |
 | `timing` | Run wall time from database timestamps, sum of latest persisted step executions, and accumulated gate wait |
 | `phases` | Each pipeline step's outcome, latest execution duration, criticality, cycle/fix counts, and finding counts; setup has its own journal-derived entry |
-| `rounds` | Existing `step_rounds` duration and fix designation for each execution round |
+| `rounds` | Existing `step_rounds` duration and fix designation for each execution round; review rounds also carry `review_max_passes`, `review_scope`, `review_model`, and `risk_level` when recorded |
 | `invocations` | Existing agent duration, outcome/failure category, session mode, nullable per-round token/cache counters, workload size, tool counts, and findings |
 | `details` | Journal spans with operation, owning step/round, timestamps, outcome/exit code, failure class, numeric input shape, and criticality |
 | `observed_timing` | Cycle execution and observed active/external/human split across all recorded passes |

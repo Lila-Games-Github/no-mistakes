@@ -58,6 +58,22 @@ func TestFallbackAgentFallsBackOnLaunchFailure(t *testing.T) {
 	}
 }
 
+func TestFallbackAgentRejectsUnsupportedReviewModelFallback(t *testing.T) {
+	first := &fallbackTestAgent{name: "claude", run: func() (*Result, error) {
+		return nil, errors.New(`claude start: exec: "claude": executable file not found`)
+	}}
+	second := &fallbackTestAgent{name: "pi", run: func() (*Result, error) {
+		return &Result{Text: "would silently ignore model"}, nil
+	}}
+	_, err := NewFallback([]Agent{first, second}).Run(context.Background(), RunOpts{Model: "sonnet"})
+	if err == nil || !strings.Contains(err.Error(), "cannot honor review model override") {
+		t.Fatalf("Run() error = %v, want unsupported model failure", err)
+	}
+	if first.calls != 1 || second.calls != 0 {
+		t.Fatalf("calls = first %d second %d, want 1/0", first.calls, second.calls)
+	}
+}
+
 func TestFallbackAgentDoesNotFallBackOnFindingsResult(t *testing.T) {
 	first := &fallbackTestAgent{
 		name: "codex",

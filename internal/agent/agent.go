@@ -25,6 +25,8 @@ type Agent interface {
 // RunOpts configures a single agent invocation.
 type RunOpts struct {
 	Prompt string
+	// Model overrides the configured model for this invocation when supported.
+	Model string
 	// Env appends invocation-scoped environment entries to the agent process.
 	// Entries later in the slice override inherited values.
 	Env         []string

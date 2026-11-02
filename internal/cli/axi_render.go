@@ -435,6 +435,15 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		fields = append(fields, toon.Field{Key: "pr", Value: rv.PRURL})
 	}
 	fields = append(fields, toon.Field{Key: "findings", Value: rv.findingsTally()})
+	for _, step := range rv.Steps {
+		if step.Name != string(types.StepReview) || step.FindingsJSON == "" {
+			continue
+		}
+		if findings, err := types.ParseFindingsJSON(step.FindingsJSON); err == nil && findings.ReviewMaxPasses > 0 {
+			fields = append(fields, toon.Field{Key: "review_pass_limit", Value: findings.ReviewMaxPasses}, toon.Field{Key: "review_scope", Value: findings.ReviewScope}, toon.Field{Key: "review_model", Value: findings.ReviewModel}, toon.Field{Key: "review_risk", Value: findings.RiskLevel})
+		}
+		break
+	}
 
 	rows := make([]stepRow, 0, len(rv.Steps))
 	for _, s := range rv.Steps {
@@ -460,6 +469,9 @@ func gateFields(gate stepView) []toon.Field {
 	}
 	if parsed.RiskLevel != "" {
 		gfields = append(gfields, toon.Field{Key: "risk", Value: parsed.RiskLevel})
+	}
+	if gate.Name == string(types.StepReview) && parsed.ReviewMaxPasses > 0 {
+		gfields = append(gfields, toon.Field{Key: "review_pass_limit", Value: parsed.ReviewMaxPasses}, toon.Field{Key: "review_scope", Value: parsed.ReviewScope}, toon.Field{Key: "review_model", Value: parsed.ReviewModel})
 	}
 	// Point-of-use reminder at the review gate: review auto-fix defaults to
 	// disabled, so agents should expect blocking and ask-user findings to park
