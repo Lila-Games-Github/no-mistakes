@@ -74,7 +74,7 @@ auto_fix:
   test: 3
   document: 3
   lint: 5
-  ci: 3
+  ci: 1
 
 # Read only from the trusted default branch: each rerun is another workflow run.
 ci:
@@ -157,7 +157,7 @@ The setting applies to both new and resumed sessions.
 
 The gate fails before launching an agent if any resolved agent or fallback lacks a verified suppression mechanism.
 It also fails if `agent_args_override` defeats suppression, such as a nonzero Codex `project_doc_max_bytes` or Claude setting sources that include `project` or `local`.
-When this option is `false`, missing, or `null`, all agents retain their existing project-setting behavior.
+When global [`context_brief`](/reference/global-config/#context_brief) is enabled (the default), project settings are suppressed regardless of this repository value. When that global option is off, `false`, missing, or `null` here preserves project-setting loading.
 
 This field is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of `allow_repo_commands`.
 A pushed branch cannot enable it or disable a trusted opt-in.
@@ -385,7 +385,7 @@ Override auto-fix attempt limits for specific steps. Fields not set here inherit
 | `auto_fix.test` | `int` | Inherits from global (default `3`) |
 | `auto_fix.document` | `int` | Inherits from global (default `3`) |
 | `auto_fix.lint` | `int` | Inherits from global (default `3`) |
-| `auto_fix.ci` | `int` | Inherits from global (default `3`) |
+| `auto_fix.ci` | `int` | Inherits from global (default `1`) |
 
 Set to `0` to disable the follow-up auto-fix loop for a step (findings require manual approval).
 The document step attempts documentation fixes during its initial pass, so unresolved documentation findings pause for approval instead of using an automatic follow-up loop.

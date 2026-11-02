@@ -76,6 +76,20 @@ func TestLintStep_FixMode_CommitsChanges(t *testing.T) {
 	}
 }
 
+func TestLintStep_ContextBriefRunsConfiguredCommandWithoutAgent(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "unexpected", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		t.Fatal("lint agent ran after successful plain command")
+		return nil, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{Lint: "true"})
+	sctx.Config.ContextBrief = true
+	outcome, err := (&LintStep{}).Execute(sctx)
+	if err != nil || outcome == nil || outcome.NeedsApproval {
+		t.Fatalf("lint command outcome=%+v, error=%v", outcome, err)
+	}
+}
+
 func TestLintStep_FixMode_UsesFallbackSummaryWhenStructuredSummaryMalformed(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

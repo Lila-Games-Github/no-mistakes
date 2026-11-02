@@ -80,7 +80,7 @@ type StepRoundStats struct {
 // IsFixRound reports whether this round was a fix attempt. Legacy "user_fix"
 // rounds count: they were fix rounds dispatched by an explicit user selection.
 func (r *StepRound) IsFixRound() bool {
-	return r.Trigger == "auto_fix" || r.Trigger == "user_fix"
+	return r.Trigger == "auto_fix" || r.Trigger == "user_fix" || r.Trigger == "final_fix_unreviewed"
 }
 
 // StepFixSummaries returns one entry per fix round for a step, in round order:

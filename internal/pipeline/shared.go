@@ -21,6 +21,7 @@ type HousekeepingLintResult struct {
 type RunShared struct {
 	mu               sync.Mutex
 	housekeepingLint *HousekeepingLintResult
+	contextBrief     string
 }
 
 // SetHousekeepingLint records the combined pass's lint assessment for the

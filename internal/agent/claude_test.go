@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,6 +41,24 @@ func TestClaudeAgent_BuildArgs(t *testing.T) {
 		if args[i] != want {
 			t.Errorf("arg[%d]: expected %q, got %q", i, want, args[i])
 		}
+	}
+}
+
+func TestClaudeAgent_PreparedContextUsesSmallToolCatalog(t *testing.T) {
+	a := &claudeAgent{disableProjectSettings: true}
+	args := a.buildInvocationArgs(nil, "", true)
+	if !claudeArgsContainPair(args, "--tools", "Bash") || !claudeArgsContainPair(args, "--setting-sources", "user") {
+		t.Fatalf("prepared invocation flags = %v", args)
+	}
+	if !slices.Contains(args, "--disable-slash-commands") || !slices.Contains(args, "--safe-mode") {
+		t.Fatalf("prepared invocation retained skill catalog: %v", args)
+	}
+	a.extraArgs = []string{"--tools=Read,Bash"}
+	if args = a.buildInvocationArgs(nil, "", true); claudeArgsContainPair(args, "--tools", "Bash") {
+		t.Fatalf("operator tool pin was overwritten: %v", args)
+	}
+	if args = a.buildInvocationArgs(nil, "", false); slices.Contains(args, "--disable-slash-commands") || slices.Contains(args, "--safe-mode") || claudeArgsContainPair(args, "--tools", "Bash") {
+		t.Fatalf("context opt-out kept lean catalog: %v", args)
 	}
 }
 
@@ -364,6 +383,40 @@ func TestParseClaudeEvents_CacheTokens(t *testing.T) {
 	}
 	if usage.CacheCreationTokens != 10 {
 		t.Errorf("expected cache creation tokens 10, got %d", usage.CacheCreationTokens)
+	}
+}
+
+func TestParseClaudeEvents_DeduplicatesMessageUsageAndCountsTools(t *testing.T) {
+	events := `{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":30000,"cache_creation_input_tokens":1000},"content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"rg -n TODO internal"}}]}}
+{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":30000,"cache_creation_input_tokens":1000},"content":[{"type":"text","text":"checking"}]}}
+{"type":"assistant","message":{"id":"msg-2","usage":{"input_tokens":4,"output_tokens":5,"cache_read_input_tokens":35000,"cache_creation_input_tokens":1500},"content":[{"type":"tool_use","id":"tool-2","name":"Edit","input":{}}]}}
+`
+	var usage TokenUsage
+	var metrics InvocationMetrics
+	if err := parseClaudeEventsDetailed(context.Background(), strings.NewReader(events), nil, &usage, nil, &metrics, 0); err != nil {
+		t.Fatal(err)
+	}
+	if usage.InputTokens != 6 || usage.OutputTokens != 8 || usage.CacheReadTokens != 65000 || usage.CacheCreationTokens != 2500 {
+		t.Fatalf("usage counted a repeated message: %+v", usage)
+	}
+	if metrics.ModelRoundtrips != 2 || metrics.ToolCalls != 2 || metrics.ToolCategories.Read != 1 || metrics.ToolCategories.Edit != 1 {
+		t.Fatalf("metrics = %+v", metrics)
+	}
+}
+
+func TestParseClaudeEvents_StopsAtInputBudgetWithPartialUsage(t *testing.T) {
+	events := `{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":2,"cache_read_input_tokens":40,"cache_creation_input_tokens":8},"content":[]}}
+{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":2,"cache_read_input_tokens":40,"cache_creation_input_tokens":8},"content":[]}}
+{"type":"assistant","message":{"id":"msg-2","usage":{"input_tokens":1,"cache_read_input_tokens":51,"cache_creation_input_tokens":0},"content":[]}}
+`
+	var usage TokenUsage
+	var metrics InvocationMetrics
+	err := parseClaudeEventsDetailed(context.Background(), strings.NewReader(events), nil, &usage, nil, &metrics, 100)
+	if !errors.Is(err, ErrInputTokenBudget) {
+		t.Fatalf("error = %v, want budget stop", err)
+	}
+	if usage.InputTokens+usage.CacheReadTokens+usage.CacheCreationTokens != 102 || metrics.ModelRoundtrips != 2 {
+		t.Fatalf("partial usage = %+v, metrics = %+v", usage, metrics)
 	}
 }
 

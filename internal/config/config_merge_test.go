@@ -119,8 +119,8 @@ func TestMerge_AutoFixDefaults(t *testing.T) {
 	if cfg.AutoFix.Document != 3 {
 		t.Errorf("document = %d, want 3", cfg.AutoFix.Document)
 	}
-	if cfg.AutoFix.CI != 3 {
-		t.Errorf("ci = %d, want 3", cfg.AutoFix.CI)
+	if cfg.AutoFix.CI != 1 {
+		t.Errorf("ci = %d, want 1", cfg.AutoFix.CI)
 	}
 	if cfg.AutoFix.Rebase != 3 {
 		t.Errorf("rebase = %d, want 3", cfg.AutoFix.Rebase)

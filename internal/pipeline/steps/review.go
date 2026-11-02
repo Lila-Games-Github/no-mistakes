@@ -158,6 +158,9 @@ Previous review findings to address:
 		fixSummary = summary
 	}
 	reviewTargetSHA := sctx.Run.HeadSHA
+	if sctx.FinalFixWithoutReview {
+		return &pipeline.StepOutcome{FixSummary: fixSummary, ReviewApprovedHeadSHA: reviewTargetSHA, FinalFixUnreviewed: true}, nil
+	}
 
 	// The changed-file set is read once and viewed two ways on purpose: the
 	// ignore-filtered subset keeps the legacy small-review skip, while trusted
@@ -244,6 +247,10 @@ Previous review findings to address:
 	pathInstructionMatches := matchPathInstructions(changed, sctx.Config.Review.PathInstructions)
 	logPathInstructions(sctx.Log, pathInstructionMatches)
 	pathInstructions := reviewPathInstructionsSection(pathInstructionMatches)
+	if sctx.Config.ContextBrief {
+		// The fixed prefix already carries exactly these trusted path rules.
+		pathInstructions = ""
+	}
 
 	buildReviewPrompt := func(scope, scopeClause string) string {
 		return fmt.Sprintf(

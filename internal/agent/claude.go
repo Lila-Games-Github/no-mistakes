@@ -22,6 +22,10 @@ const claudeMaxRetries = 3
 // errNoStructuredOutput is returned when Claude succeeds but omits structured output.
 var errNoStructuredOutput = errors.New("claude returned no structured output")
 
+// ErrInputTokenBudget means a model call consumed the configured input budget.
+// The parser stops reading and terminates the native process at this boundary.
+var ErrInputTokenBudget = errors.New("agent input-token budget exceeded")
+
 const claudeScannerMaxTokenSize = 256 * 1024 * 1024
 
 // claudeAgent spawns the claude CLI for each invocation.
@@ -76,7 +80,7 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	if opts.Model != "" {
 		commandAgent.extraArgs = append(append([]string(nil), a.extraArgs...), "--model", opts.Model)
 	}
-	args := commandAgent.buildArgs(opts.JSONSchema, resumeID)
+	args := commandAgent.buildInvocationArgs(opts.JSONSchema, resumeID, opts.PreparedContext)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
 	// Claude Code print mode documents text stdin as its non-interactive
@@ -105,11 +109,15 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 
 	var usage TokenUsage
 	var result *claudeResult
-	if err := parseClaudeEvents(ctx, started.stdout, opts.OnChunk, &usage, &result); err != nil {
+	var metrics InvocationMetrics
+	if err := parseClaudeEventsDetailed(ctx, started.stdout, opts.OnChunk, &usage, &result, &metrics, opts.MaxInputTokens); err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
 		retErr := fmt.Errorf("claude parse events: %w", err)
 		emitAgentExited(opts, "claude", pid, retErr)
+		if errors.Is(err, ErrInputTokenBudget) {
+			return &Result{Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported, Metrics: &metrics}, retErr
+		}
 		return nil, retErr
 	}
 
@@ -129,6 +137,7 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 
 	res, err := finalizeClaudeResult(result, opts.JSONSchema, usage)
 	if res != nil {
+		res.Metrics = &metrics
 		res.SessionID = result.sessionID
 		res.Resumed = resumeID != ""
 		res.Model = result.model
@@ -149,6 +158,23 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	}
 	emitAgentExited(opts, "claude", pid, err)
 	return res, err
+}
+
+func (a *claudeAgent) buildInvocationArgs(schema json.RawMessage, resumeID string, prepared bool) []string {
+	args := a.buildArgs(schema, resumeID)
+	if prepared {
+		// The prepared brief supplies task context. Safe mode drops user and
+		// project customizations while preserving auth; the ordinary user-only
+		// setting-sources switch does not drop user plugins or MCP catalogs.
+		// A single shell tool retains read/edit/test capability with a small
+		// schema on every model round trip. Respect an explicit operator tool pin.
+		args = append(args, "--safe-mode")
+		if !claudeUserSetTools(a.extraArgs) {
+			args = append(args, "--tools", "Bash")
+		}
+		args = append(args, "--disable-slash-commands")
+	}
+	return args
 }
 
 func (a *claudeAgent) Close() error { return nil }
@@ -215,6 +241,15 @@ func (a *claudeAgent) buildArgs(schema json.RawMessage, resumeID string) []strin
 func claudeUserSetSettingSources(extraArgs []string) bool {
 	_, pinned := claudeUserSettingSources(extraArgs)
 	return pinned
+}
+
+func claudeUserSetTools(extraArgs []string) bool {
+	for _, arg := range extraArgs {
+		if arg == "--tools" || strings.HasPrefix(arg, "--tools=") {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeUserSettingSources returns the operator-pinned --setting-sources value
@@ -299,24 +334,51 @@ type claudeUsage struct {
 }
 
 type claudeMessage struct {
+	ID      string          `json:"id"`
 	Model   string          `json:"model"`
 	Usage   claudeUsage     `json:"usage"`
 	Content []claudeContent `json:"content"`
 }
 
 type claudeContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type  string          `json:"type"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+	Text  string          `json:"text"`
 }
 
 // parseClaudeEvents reads JSONL from the reader and dispatches events.
 // It accumulates token usage and captures the final result event.
 func parseClaudeEvents(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage, result **claudeResult) error {
+	return parseClaudeEventsDetailed(ctx, r, onChunk, usage, result, nil, 0)
+}
+
+// parseClaudeEventsDetailed counts each model message once. Claude's stream-json
+// emits a separate assistant event for each content block, repeating the same
+// message ID and usage; summing events can nearly double billed input tokens.
+func parseClaudeEventsDetailed(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage, result **claudeResult, metrics *InvocationMetrics, maxInputTokens int) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), claudeScannerMaxTokenSize)
 	var textBuf string
 	var lastSessionID string
 	var lastModel string
+	seenMessages := make(map[string]claudeUsage)
+	seenTools := make(map[string]struct{})
+	unnamedMessage := 0
+	totalInput := 0
+	defer func() {
+		for _, u := range seenMessages {
+			usage.Add(TokenUsage{
+				InputTokens:           u.InputTokens,
+				OutputTokens:          u.OutputTokens,
+				CacheReadTokens:       u.CacheReadInputTokens,
+				CacheCreationTokens:   u.CacheCreationInputTokens,
+				Reported:              true,
+				CacheCreationReported: true,
+			})
+		}
+	}()
 
 	for scanner.Scan() {
 		select {
@@ -347,15 +409,38 @@ func parseClaudeEvents(ctx context.Context, r io.Reader, onChunk func(string), u
 			if msg.Model != "" {
 				lastModel = msg.Model
 			}
-			usage.Add(TokenUsage{
-				InputTokens:           msg.Usage.InputTokens,
-				OutputTokens:          msg.Usage.OutputTokens,
-				CacheReadTokens:       msg.Usage.CacheReadInputTokens,
-				CacheCreationTokens:   msg.Usage.CacheCreationInputTokens,
-				Reported:              true,
-				CacheCreationReported: true,
-			})
+			key := msg.ID
+			if key == "" {
+				unnamedMessage++
+				key = fmt.Sprintf("event:%d", unnamedMessage)
+			}
+			// The later event for a message may carry final usage. Keep its
+			// largest counters without accumulating repeated content blocks.
+			previous, existed := seenMessages[key]
+			msg.Usage.InputTokens = max(previous.InputTokens, msg.Usage.InputTokens)
+			msg.Usage.OutputTokens = max(previous.OutputTokens, msg.Usage.OutputTokens)
+			msg.Usage.CacheReadInputTokens = max(previous.CacheReadInputTokens, msg.Usage.CacheReadInputTokens)
+			msg.Usage.CacheCreationInputTokens = max(previous.CacheCreationInputTokens, msg.Usage.CacheCreationInputTokens)
+			seenMessages[key] = msg.Usage
+			totalInput += msg.Usage.InputTokens + msg.Usage.CacheReadInputTokens + msg.Usage.CacheCreationInputTokens - previous.InputTokens - previous.CacheReadInputTokens - previous.CacheCreationInputTokens
+			if metrics != nil && !existed {
+				metrics.ModelRoundtrips++
+			}
+			if maxInputTokens > 0 && totalInput > maxInputTokens {
+				return fmt.Errorf("%w: %d > %d", ErrInputTokenBudget, totalInput, maxInputTokens)
+			}
 			for _, c := range msg.Content {
+				if metrics != nil && c.Type == "tool_use" {
+					toolKey := c.ID
+					if toolKey == "" {
+						toolKey = fmt.Sprintf("%s:%d", key, metrics.ToolCalls)
+					}
+					if _, found := seenTools[toolKey]; !found {
+						seenTools[toolKey] = struct{}{}
+						metrics.ToolCalls++
+						claudeClassifyTool(c, &metrics.ToolCategories)
+					}
+				}
 				if c.Type == "text" && c.Text != "" {
 					textBuf += c.Text
 					if onChunk != nil {
@@ -380,6 +465,27 @@ func parseClaudeEvents(ctx context.Context, r io.Reader, onChunk func(string), u
 			}
 		}
 	}
-
 	return scanner.Err()
+}
+
+func claudeClassifyTool(c claudeContent, categories *ToolCategoryCounts) {
+	if c.Name == "Bash" {
+		var input struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(c.Input, &input) == nil {
+			for _, category := range ClassifyToolCommand(input.Command) {
+				categories.Add(category)
+			}
+			return
+		}
+	}
+	switch c.Name {
+	case "Read", "Glob", "Grep":
+		categories.Add(ToolRead)
+	case "Edit", "Write", "NotebookEdit":
+		categories.Add(ToolEdit)
+	default:
+		categories.Add(ToolOther)
+	}
 }

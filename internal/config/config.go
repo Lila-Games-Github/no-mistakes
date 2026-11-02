@@ -157,6 +157,10 @@ type GlobalConfig struct {
 	Eval Eval
 	// LeanTurns is global-only for the same reason (see LeanTurns).
 	LeanTurns LeanTurns
+	// ContextBrief shares a bounded, deterministic change brief across pipeline
+	// agents. It is global-only so a pushed branch cannot remove the context
+	// and instruction boundary used to validate itself.
+	ContextBrief bool
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -186,6 +190,7 @@ type globalConfigRaw struct {
 	Test                    TestRaw                    `yaml:"test"`
 	Eval                    EvalRaw                    `yaml:"eval"`
 	LeanTurns               LeanTurnsRaw               `yaml:"lean_turns"`
+	ContextBrief            *bool                      `yaml:"context_brief"`
 	ForgeProfiles           ForgeProfiles              `yaml:"forge_profiles"`
 }
 
@@ -528,6 +533,7 @@ type Config struct {
 	SessionReuse          bool
 	Eval                  Eval
 	LeanTurns             LeanTurns
+	ContextBrief          bool
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
@@ -539,8 +545,8 @@ type Config struct {
 	Review                Review
 	PR                    PR
 	ForgeProfiles         ForgeProfiles
-	// DisableProjectSettings is the resolved, trusted-only opt-out (see the
-	// RepoConfig field). When true, gate agents are launched with their
+	// DisableProjectSettings is the resolved gate boundary. The trusted repo
+	// setting or the global context_brief default enables it. Gate agents are launched with their
 	// project-level settings/instructions suppressed; the daemon fails the run
 	// closed if the resolved harness has no verified suppression knob.
 	DisableProjectSettings bool
@@ -827,6 +833,11 @@ branch_sync_remote_timeout: "60s"
 # Set false to force every agent invocation cold.
 session_reuse: true
 
+# Reuse one bounded change brief across pipeline agent steps, suppress project
+# instruction auto-loading, and enforce the default input-token budgets.
+# Set false to restore the previous pipeline behavior.
+context_brief: true
+
 # Turn-economy measures for slow harnesses, applied only to the listed agents
 # (every other agent is unchanged): a cached repository run-book in review and
 # fix prompts, a delta-first re-review after each fix round (a full-scope
@@ -904,7 +915,7 @@ auto_fix:
   test: 3
   review: 0
   document: 3
-  ci: 3
+  ci: 1
 
 # How many times the CI step may re-run a single check the provider reported as
 # cancelled before that check reaches an approval gate instead of the fix agent.
@@ -1625,6 +1636,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
 		LeanTurns:               leanTurnsDefaults(),
+		ContextBrief:            true,
 	}
 }
 
@@ -1911,6 +1923,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Test = raw.Test
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
 	applyLeanTurnsOverrides(&cfg.LeanTurns, &raw.LeanTurns)
+	if raw.ContextBrief != nil {
+		cfg.ContextBrief = *raw.ContextBrief
+	}
 
 	return cfg, nil
 }
@@ -2455,7 +2470,7 @@ func autoFixDefaults() AutoFix {
 		Test:     3,
 		Review:   0,
 		Document: 3,
-		CI:       3,
+		CI:       1,
 		Rebase:   3,
 	}
 }
@@ -2579,6 +2594,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
 		LeanTurns:      global.LeanTurns,
+		ContextBrief:   global.ContextBrief,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,
@@ -2592,7 +2608,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		ForgeProfiles:  global.ForgeProfiles,
 		// repo is the EffectiveRepoConfig result, so this value is already
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
-		DisableProjectSettings: repo.DisableProjectSettings,
+		DisableProjectSettings: repo.DisableProjectSettings || global.ContextBrief,
 		NoCI:                   repo.NoCI,
 	}
 

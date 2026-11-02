@@ -34,8 +34,11 @@ The top-level `schema_version` is `1`. Consumers should check it before interpre
 | `run_id`, `status`, `generated_at` | Local correlation identity, current stored outcome, and UTC snapshot time |
 | `timing` | Run wall time from database timestamps, sum of latest persisted step executions, and accumulated gate wait |
 | `phases` | Each pipeline step's outcome, latest execution duration, criticality, cycle/fix counts, and finding counts; setup has its own journal-derived entry |
-| `rounds` | Existing `step_rounds` duration and fix designation for each execution round; review rounds also carry `review_max_passes`, `review_scope`, `review_model`, and `risk_level` when recorded |
-| `invocations` | Existing agent duration, outcome/failure category, session mode, nullable per-round token/cache counters, workload size, tool counts, and findings |
+| `rounds` | Existing `step_rounds` duration and fix designation for each execution round; review rounds also carry `review_max_passes`, `review_scope`, `review_model`, and `risk_level` when recorded. `unreviewed_final_fix` marks a named fix explicitly applied at the review pass cap without another review. |
+| `invocations` | Existing agent duration, outcome/failure category, session mode, nullable per-round token/cache counters, total input including Claude cache traffic, output, model round trips, workload size, tool counts, and findings |
+| `run_usage`, `step_usage` | Nullable sums of agent input, output, round trips, and agent wall milliseconds for the run and each step; unknown counters remain null when any invocation lacked them |
+| `ci_ready` | Wall milliseconds from run start to durable CI-ready, and observed check-poll waiting before that point; later merge monitoring is excluded |
+| `unreviewed_final_fix` | True if the decider chose `fix-final` at the review pass cap; this final repair was not independently re-reviewed |
 | `details` | Journal spans with operation, owning step/round, timestamps, outcome/exit code, failure class, numeric input shape, and criticality |
 | `observed_timing` | Cycle execution and observed active/external/human split across all recorded passes |
 | `prior_branch_runs` | Earlier recorded runs on this branch; this is not a retry count |

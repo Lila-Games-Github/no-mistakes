@@ -15,6 +15,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
@@ -121,6 +122,9 @@ func runStateFingerprint(rv runView) string {
 func annotateRunView(env *axiEnv, rv *runView) {
 	if env == nil || rv == nil {
 		return
+	}
+	if metrics, err := runmetrics.Build(env.d, rv.ID, env.p.RunLogDir(rv.ID), time.Now()); err == nil {
+		rv.Metrics = metrics
 	}
 	quietWarning := configQuietWarning(env)
 	for i := range rv.Steps {
