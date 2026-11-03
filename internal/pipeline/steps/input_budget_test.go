@@ -285,7 +285,13 @@ func boundedClaudeFixture(t *testing.T) (agent.Agent, string) {
 // tools, sessions or structured-output tool may hide extra model requests.
 func fakeBoundedClaudeHandler() {
 	args := strings.Join(os.Args[1:], "\x00")
-	if !strings.Contains(args, "--max-turns\x001") || !strings.Contains(args, "--tools\x00\x00") || strings.Contains(args, "--resume") || strings.Contains(args, "--json-schema") {
+	toolFlags := 0
+	for _, arg := range os.Args[1:] {
+		if arg == "--tools" || strings.HasPrefix(arg, "--tools=") {
+			toolFlags++
+		}
+	}
+	if toolFlags != 1 || !strings.Contains(args, "--max-turns\x001") || !strings.Contains(args, "--tools\x00\x00") || strings.Contains(args, "--resume") || strings.Contains(args, "--json-schema") {
 		fmt.Fprintln(os.Stderr, "unbounded native args")
 		os.Exit(90)
 	}

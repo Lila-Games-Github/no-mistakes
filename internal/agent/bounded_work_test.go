@@ -162,3 +162,13 @@ func TestClaudeAgent_BoundedModeRejectsStructuredOutputToolOverride(t *testing.T
 		}
 	}
 }
+
+func TestClaudeAgent_BoundedModeRejectsNativeToolsOverride(t *testing.T) {
+	for _, args := range [][]string{{"--tools", "Bash"}, {"--tools=Read,Bash"}} {
+		a := &claudeAgent{bin: "must-not-be-started", extraArgs: args}
+		_, err := a.Run(context.Background(), RunOpts{Prompt: "review", BoundedWork: true, MaxInputTokens: 150000, MaxTotalInputTokens: 1500000})
+		if err == nil || !strings.Contains(err.Error(), "agent_args_override flag --tools") {
+			t.Fatalf("native tools override = %v", err)
+		}
+	}
+}
