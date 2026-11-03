@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -105,7 +106,7 @@ func TestBoundedWork_StopsNoProgressWithoutAcceptingPartialWork(t *testing.T) {
 	calls := 0
 	_, err := runBoundedWork(context.Background(), RunOpts{Prompt: "fix", MaxInputTokens: 150000, MaxTotalInputTokens: 1500000}, func(RunOpts) (*Result, error) {
 		calls++
-		return boundedTestResult(boundedAction{Checkpoint: "still investigating", Command: "read same file"}), nil
+		return boundedTestResult(boundedAction{Checkpoint: fmt.Sprintf("investigation claim %d", calls), Command: "read same file"}), nil
 	}, func(string) (string, error) { return "same contents", nil })
 	if err == nil || !strings.Contains(err.Error(), "no progress") || calls != 3 {
 		t.Fatalf("calls=%d err=%v", calls, err)

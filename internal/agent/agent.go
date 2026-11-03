@@ -34,6 +34,11 @@ type RunOpts struct {
 	// bounds the sum (including caches, ingestion and corrective calls).
 	BoundedWork         bool
 	MaxTotalInputTokens int
+	// ClaudeWorkBudget requests bounded work if dispatch selects Claude,
+	// including a secondary fallback provider. Other providers keep their native
+	// execution and session behavior. The remaining allowance is read at actual
+	// dispatch so earlier failed providers or resumes are included.
+	ClaudeWorkBudget *BoundedWorkBudget
 	// PreparedContext uses the pipeline's bounded brief and asks native adapters
 	// to keep their tool and skill catalogs small when they support that switch.
 	PreparedContext bool
@@ -75,6 +80,13 @@ type RunOpts struct {
 	// this invocation's structured output failed to parse or validate (see
 	// runWithStructuredOutputReask). Instrumentation only; adapters ignore it.
 	StructuredOutputReask bool
+}
+
+// BoundedWorkBudget carries the duty's per-call limit and a live read of its
+// remaining run allowance. It contains no provider session or transcript.
+type BoundedWorkBudget struct {
+	MaxInputTokens       int
+	RemainingInputTokens func() (int, error)
 }
 
 // Attempt describes one completed concrete adapter attempt for an agent

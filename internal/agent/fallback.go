@@ -86,6 +86,11 @@ func (a *fallbackAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 	}
 	var lastErr error
 	for i, current := range candidates {
+		if current.Name() == "claude" && opts.ClaudeWorkBudget != nil {
+			// Once Claude has accepted a bounded duty, a later provider cannot
+			// silently retry it with unbounded native tools or a transcript.
+			opts.BoundedWork = true
+		}
 		currentOpts := opts
 		if opts.BoundedWork && current.Name() != "claude" {
 			return nil, fmt.Errorf("agent %s cannot honor bounded Claude work", current.Name())

@@ -86,10 +86,19 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 			if limit <= 0 {
 				return nil, fmt.Errorf("%w: run consumed %d of %d input tokens", agent.ErrInputTokenBudget, spent, defaultRunInputBudget)
 			}
-			// Claude review, review-fix and CI repair use cold, single-action
-			// calls. The shared run ceiling still includes every native call.
-			if ag != nil && ag.Name() == "claude" && (sctx.StepName == types.StepReview || sctx.StepName == types.StepCI) {
-				opts.BoundedWork = true
+			// The actual provider may differ from the wrapper's primary name.
+			// Carry Claude's policy through dispatch and refresh the allowance
+			// after any failed provider or fixer resume, whose usage is recorded.
+			if sctx.StepName == types.StepReview || sctx.StepName == types.StepCI {
+				opts.ClaudeWorkBudget = &agent.BoundedWorkBudget{
+					MaxInputTokens: defaultReviewInputBudget,
+					RemainingInputTokens: func() (int, error) {
+						spent, err := sctx.recordedRunInputTokens()
+						return defaultRunInputBudget - spent, err
+					},
+				}
+			}
+			if opts.BoundedWork {
 				opts.MaxTotalInputTokens = limit
 			}
 			if (sctx.StepName == types.StepReview || opts.BoundedWork) && limit > defaultReviewInputBudget {
@@ -101,12 +110,7 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		}
 	}
 	result, err := invokeAgent(parent, timeout, func(ctx context.Context) (*agent.Result, error) {
-		if opts.BoundedWork && sessionRole != "" && sctx != nil && sctx.Sessions != nil {
-			// A bounded checkpoint replaces the native fixer transcript. Never
-			// leave an old durable transcript available to a later unbounded turn.
-			sctx.Sessions.forget(sessionRole)
-		}
-		if !opts.BoundedWork && sessionRole != "" && sctx != nil && sctx.Sessions != nil {
+		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
 			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
 		}
 		if ag == nil {
@@ -118,12 +122,19 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		return nil, err
 	}
 	if opts.MaxInputTokens > 0 && result != nil && result.UsageReported {
-		used := invocationInputTokens(ag.Name(), result.Usage)
-		if opts.BoundedWork && result.PeakContextTokens > 0 {
+		provider := sessionProvider(ag, result)
+		limit := opts.MaxInputTokens
+		bounded := opts.BoundedWork
+		if provider == "claude" && opts.ClaudeWorkBudget != nil {
+			bounded = true
+			limit = min(limit, opts.ClaudeWorkBudget.MaxInputTokens)
+		}
+		used := invocationInputTokens(provider, result.Usage)
+		if bounded && result.PeakContextTokens > 0 {
 			used = result.PeakContextTokens
 		}
-		if used > opts.MaxInputTokens {
-			return nil, fmt.Errorf("%w: call consumed %d of %d input tokens", agent.ErrInputTokenBudget, used, opts.MaxInputTokens)
+		if used > limit {
+			return nil, fmt.Errorf("%w: call consumed %d of %d input tokens", agent.ErrInputTokenBudget, used, limit)
 		}
 	}
 	return result, nil

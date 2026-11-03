@@ -126,3 +126,33 @@ func TestClaudeAgent_BoundedTransientFailureIsRetriedWithUsage(t *testing.T) {
 		t.Fatalf("native calls=%q err=%v", count, err)
 	}
 }
+
+func TestClaudeAgent_BoundedDispatchPolicyRefusesBeforeNativeLaunch(t *testing.T) {
+	readErr := errors.New("cannot read recorded run usage")
+	for _, tc := range []struct {
+		name      string
+		remaining int
+		readErr   error
+		callLimit int
+		runLimit  int
+		want      error
+	}{
+		{name: "exhausted", want: ErrInputTokenBudget},
+		{name: "read-failure", readErr: readErr, want: readErr},
+		{name: "caller-call-limit", remaining: 1500000, callLimit: 1000, want: ErrInputTokenBudget},
+		{name: "caller-run-limit", remaining: 1500000, runLimit: 1000, want: ErrInputTokenBudget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			a := &claudeAgent{bin: "must-not-be-started"}
+			_, err := a.Run(context.Background(), RunOpts{Prompt: "review", MaxInputTokens: tc.callLimit, MaxTotalInputTokens: tc.runLimit,
+				ClaudeWorkBudget: &BoundedWorkBudget{MaxInputTokens: 150000, RemainingInputTokens: func() (int, error) {
+					reads++
+					return tc.remaining, tc.readErr
+				}}})
+			if !errors.Is(err, tc.want) || reads != 1 {
+				t.Fatalf("reads=%d err=%v want=%v", reads, err, tc.want)
+			}
+		})
+	}
+}

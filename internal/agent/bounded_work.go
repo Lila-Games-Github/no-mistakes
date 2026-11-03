@@ -77,7 +77,8 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 	corrections := 0
 	retries := 0
 	finalCorrection := false
-	seen := map[[32]byte]int{}
+	var lastCommand [32]byte
+	repeatedCommands := 0
 	for calls := 0; calls < boundedMaxCalls; calls++ {
 		if err := ctx.Err(); err != nil {
 			return combined, err
@@ -214,8 +215,15 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 					result.Metrics.ToolCategories.Add(category)
 				}
 				key := sha256.Sum256([]byte(action.Command + "\x00" + observation))
-				seen[key]++
-				if err == nil && seen[key] >= 3 {
+				// A successful focused check may recur after each independent
+				// repair. Only consecutive identical command/observation pairs
+				// establish a loop; checkpoint prose alone is not progress.
+				if key == lastCommand {
+					repeatedCommands++
+				} else {
+					lastCommand, repeatedCommands = key, 1
+				}
+				if err == nil && repeatedCommands >= 3 {
 					err = errors.New("bounded work made no progress: same command and observation three times")
 				}
 			}
@@ -225,6 +233,9 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 				if err == nil {
 					combined.Text, combined.Output = final.Text, final.Output
 					combined.StructuredOutputRepaired = final.StructuredOutputRepaired
+					// Attribute final findings to this native attempt without
+					// creating a second row or duplicating aggregate token usage.
+					result.Output = final.Output
 					result.StructuredOutputRepaired = final.StructuredOutputRepaired
 				}
 			}

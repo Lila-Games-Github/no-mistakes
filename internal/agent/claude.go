@@ -64,8 +64,31 @@ func (a *claudeAgent) NeutralizesGateInstructions() bool {
 }
 
 func (a *claudeAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
+	if budget := opts.ClaudeWorkBudget; budget != nil {
+		if budget.MaxInputTokens <= 0 || budget.RemainingInputTokens == nil {
+			return nil, errors.New("bounded Claude work requires a per-call limit and remaining run allowance")
+		}
+		opts.BoundedWork = true
+		if opts.MaxInputTokens == 0 || opts.MaxInputTokens > budget.MaxInputTokens {
+			opts.MaxInputTokens = budget.MaxInputTokens
+		}
+		remaining, err := budget.RemainingInputTokens()
+		if err != nil {
+			return nil, err
+		}
+		if remaining <= 0 {
+			return nil, fmt.Errorf("%w: run has %d input tokens remaining", ErrInputTokenBudget, remaining)
+		}
+		if opts.MaxTotalInputTokens == 0 || opts.MaxTotalInputTokens > remaining {
+			opts.MaxTotalInputTokens = remaining
+		}
+	}
 	if opts.BoundedWork {
-		return a.runBoundedWork(ctx, opts)
+		result, err := a.runBoundedWork(ctx, opts)
+		if result != nil {
+			result.Provider = a.Name()
+		}
+		return result, err
 	}
 	return runWithStructuredOutputReask(ctx, "claude", opts, func(opts RunOpts) (*Result, error) {
 		return runWithRetry(ctx, "claude", opts, claudeMaxRetries, claudeRetryClassifier, nil, func() (*Result, error) {
