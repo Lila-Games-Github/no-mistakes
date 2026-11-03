@@ -87,6 +87,9 @@ func (a *fallbackAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 	var lastErr error
 	for i, current := range candidates {
 		currentOpts := opts
+		if opts.BoundedWork && current.Name() != "claude" {
+			return nil, fmt.Errorf("agent %s cannot honor bounded Claude work", current.Name())
+		}
 		if opts.Model != "" && current.Name() != "claude" && current.Name() != "codex" {
 			return nil, fmt.Errorf("agent %s cannot honor review model override %q", current.Name(), opts.Model)
 		}

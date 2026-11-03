@@ -28,6 +28,12 @@ type RunOpts struct {
 	// MaxInputTokens stops an invocation once reported provider input usage
 	// exceeds this limit. Zero disables the limit.
 	MaxInputTokens int
+	// BoundedWork delegates tools to the adapter's bounded action loop instead
+	// of allowing an unbounded native conversation. Currently supported by Claude.
+	// MaxInputTokens then bounds each cold native call, while MaxTotalInputTokens
+	// bounds the sum (including caches, ingestion and corrective calls).
+	BoundedWork         bool
+	MaxTotalInputTokens int
 	// PreparedContext uses the pipeline's bounded brief and asks native adapters
 	// to keep their tool and skill catalogs small when they support that switch.
 	PreparedContext bool

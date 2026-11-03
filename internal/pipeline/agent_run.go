@@ -86,7 +86,13 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 			if limit <= 0 {
 				return nil, fmt.Errorf("%w: run consumed %d of %d input tokens", agent.ErrInputTokenBudget, spent, defaultRunInputBudget)
 			}
-			if sctx.StepName == types.StepReview && limit > defaultReviewInputBudget {
+			// Claude review, review-fix and CI repair use cold, single-action
+			// calls. The shared run ceiling still includes every native call.
+			if ag != nil && ag.Name() == "claude" && (sctx.StepName == types.StepReview || sctx.StepName == types.StepCI) {
+				opts.BoundedWork = true
+				opts.MaxTotalInputTokens = limit
+			}
+			if (sctx.StepName == types.StepReview || opts.BoundedWork) && limit > defaultReviewInputBudget {
 				limit = defaultReviewInputBudget
 			}
 			if opts.MaxInputTokens == 0 || opts.MaxInputTokens > limit {
@@ -95,7 +101,12 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		}
 	}
 	result, err := invokeAgent(parent, timeout, func(ctx context.Context) (*agent.Result, error) {
-		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
+		if opts.BoundedWork && sessionRole != "" && sctx != nil && sctx.Sessions != nil {
+			// A bounded checkpoint replaces the native fixer transcript. Never
+			// leave an old durable transcript available to a later unbounded turn.
+			sctx.Sessions.forget(sessionRole)
+		}
+		if !opts.BoundedWork && sessionRole != "" && sctx != nil && sctx.Sessions != nil {
 			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
 		}
 		if ag == nil {
@@ -108,6 +119,9 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	}
 	if opts.MaxInputTokens > 0 && result != nil && result.UsageReported {
 		used := invocationInputTokens(ag.Name(), result.Usage)
+		if opts.BoundedWork && result.PeakContextTokens > 0 {
+			used = result.PeakContextTokens
+		}
 		if used > opts.MaxInputTokens {
 			return nil, fmt.Errorf("%w: call consumed %d of %d input tokens", agent.ErrInputTokenBudget, used, opts.MaxInputTokens)
 		}
