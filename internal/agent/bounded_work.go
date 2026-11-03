@@ -43,6 +43,43 @@ type boundedAction struct {
 	ReadPage   int    `json:"read_page"`
 }
 
+// Resolve the live run allowance at actual provider dispatch, after failed
+// attempts have been recorded. Caller-supplied tighter limits always win.
+func boundedWorkOptions(provider string, opts RunOpts) (RunOpts, error) {
+	if budget := opts.ClaudeWorkBudget; budget != nil {
+		if budget.MaxInputTokens <= 0 || budget.RemainingInputTokens == nil {
+			return opts, fmt.Errorf("bounded %s work requires a per-call limit and remaining run allowance", provider)
+		}
+		opts.BoundedWork = true
+		if opts.MaxInputTokens == 0 || opts.MaxInputTokens > budget.MaxInputTokens {
+			opts.MaxInputTokens = budget.MaxInputTokens
+		}
+		remaining, err := budget.RemainingInputTokens()
+		if err != nil {
+			return opts, err
+		}
+		if remaining <= 0 {
+			return opts, fmt.Errorf("%w: run has %d input tokens remaining", ErrInputTokenBudget, remaining)
+		}
+		if opts.MaxTotalInputTokens == 0 || opts.MaxTotalInputTokens > remaining {
+			opts.MaxTotalInputTokens = remaining
+		}
+	}
+	return opts, nil
+}
+
+func classifyBoundedTransient(err error) (string, bool) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "", false
+	}
+	// Only the cold, tool-free action may retry a draining-output failure.
+	// Native turns can already have run tools and must not replay on this error.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return "output drain timeout", true
+	}
+	return classifyTransient(err)
+}
+
 // runBoundedWork keeps model context independent of the number of tool calls.
 // Each subprocess makes one cold, tool-free model call. The model supplies a
 // compact checkpoint and one shell command; only a bounded observation returns
@@ -144,7 +181,7 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 			// This native call cannot have run tools. Retry its identical prompt
 			// only, accounting for failed-call input before the next preflight.
 			if !protocolErr && !errors.Is(callErr, ErrInputTokenBudget) && retries < claudeMaxRetries {
-				if label, retry := classifyTransient(callErr); retry {
+				if label, retry := classifyBoundedTransient(callErr); retry {
 					retries++
 					emitAgentRetry(call, "claude", label, retries+1, claudeMaxRetries+1)
 					finishWait := runmetrics.Start(ctx, runmetrics.BackoffWait)

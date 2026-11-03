@@ -87,12 +87,12 @@ func (a *fallbackAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 	var lastErr error
 	for i, current := range candidates {
 		if current.Name() == "claude" && opts.ClaudeWorkBudget != nil {
-			// Once Claude has accepted a bounded duty, a later provider cannot
-			// silently retry it with unbounded native tools or a transcript.
+			// Carry the bounded policy to fallback providers. Codex enforces its
+			// own native input budget; unsupported adapters still fail closed.
 			opts.BoundedWork = true
 		}
 		currentOpts := opts
-		if opts.BoundedWork && current.Name() != "claude" {
+		if opts.BoundedWork && current.Name() != "claude" && current.Name() != "codex" {
 			return nil, fmt.Errorf("agent %s cannot honor bounded Claude work", current.Name())
 		}
 		if opts.Model != "" && current.Name() != "claude" && current.Name() != "codex" {

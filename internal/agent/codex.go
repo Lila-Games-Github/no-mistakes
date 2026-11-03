@@ -53,6 +53,9 @@ func (a *codexAgent) NeutralizesGateInstructions() bool {
 }
 
 func (a *codexAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
+	if opts.BoundedWork {
+		return a.runBudgeted(ctx, opts)
+	}
 	return runWithStructuredOutputReask(ctx, "codex", opts, func(opts RunOpts) (*Result, error) {
 		return runWithRetry(ctx, "codex", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
 			return a.runOnce(ctx, opts)
@@ -60,7 +63,48 @@ func (a *codexAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
 	})
 }
 
-func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) {
+// Codex exec has no Claude-style tool-free, max-turns=1 mode. Its native shared
+// rollout budget is an enforced ceiling across the whole tool conversation.
+// Use a fresh ephemeral turn under the smaller of the duty and run allowances,
+// weighting input (including cached input) once and output zero. This is a
+// cumulative native-duty budget, not Claude's per-action checkpoint loop.
+func (a *codexAgent) runBudgeted(ctx context.Context, opts RunOpts) (*Result, error) {
+	for i, arg := range a.extraArgs {
+		feature := strings.TrimPrefix(arg, "--disable=")
+		if arg == "--disable" && i+1 < len(a.extraArgs) {
+			feature = a.extraArgs[i+1]
+		}
+		if (arg == "--disable" || strings.HasPrefix(arg, "--disable=")) && feature == "rollout_budget" {
+			return nil, fmt.Errorf("bounded codex work cannot disable native input-budget enforcement")
+		}
+	}
+	var err error
+	opts, err = boundedWorkOptions(a.Name(), opts)
+	if err != nil {
+		return nil, err
+	}
+	if opts.MaxTotalInputTokens > 0 {
+		opts.MaxInputTokens = min(opts.MaxInputTokens, opts.MaxTotalInputTokens)
+	}
+	if opts.MaxInputTokens <= 0 {
+		return nil, fmt.Errorf("%w: bounded codex work requires a positive input allowance", ErrInputTokenBudget)
+	}
+	opts.Session = nil
+	start := time.Now()
+	result, err := a.runOnce(ctx, opts)
+	emitAgentAttempt(opts, a.Name(), result, err, start, time.Now())
+	// Native failures may have already edited files and need not report usage.
+	// Do not replay them, or reset the native allowance with an automatic re-ask.
+	if result != nil {
+		cold := *result
+		cold.Provider = a.Name()
+		cold.SessionID, cold.Resumed, cold.SessionUsageCumulative = "", false, false
+		result = &cold
+	}
+	return result, err
+}
+
+func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (res *Result, err error) {
 	schemaPath := ""
 	validationSchema := opts.JSONSchema
 	if len(opts.JSONSchema) > 0 {
@@ -97,6 +141,14 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 		commandAgent.extraArgs = append(append([]string(nil), a.extraArgs...), "-m", opts.Model)
 	}
 	args := commandAgent.buildArgs(schemaPath, resumeID)
+	if opts.BoundedWork {
+		// Appended overrides are authoritative. Strict config makes older CLIs
+		// fail rather than silently ignore an unrecognized budget setting.
+		// Replace the whole table so an inherited enforce_limit=false (on newer
+		// Codex versions) cannot survive; enforcement defaults to true.
+		args = append(args, "--ephemeral", "--strict-config",
+			"-c", fmt.Sprintf("features.rollout_budget={enabled=true,limit_tokens=%d,prefill_token_weight=1.0,sampling_token_weight=0.0,reminder_at_remaining_tokens=[]}", opts.MaxInputTokens))
+	}
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
 	cmd.Stdin = strings.NewReader(opts.Prompt)
@@ -124,7 +176,24 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 	var codexErr string
 	var threadID string
 	metrics := newCodexMetricsAccumulator()
-	if err := parseCodexEvents(ctx, started.stdout, opts.OnChunk, &usage, &lastMessage, &codexErr, &threadID, metrics); err != nil {
+	defer func() {
+		if res == nil {
+			res = &Result{Text: lastMessage}
+		}
+		res.Usage, res.UsageReported = usage, usage.Reported
+		res.SessionID, res.Resumed = threadID, resumeID != ""
+		// Native Codex reports cumulative thread usage; cache reads are already
+		// included in input, and cache creation is not separately reported.
+		res.SessionUsageCumulative = true
+		m := metrics.metrics()
+		res.Metrics = &m
+		res.Model, res.ModelProvider = resolveCodexModel(threadID, time.Now())
+	}()
+	inputLimit := 0
+	if opts.BoundedWork {
+		inputLimit = opts.MaxInputTokens
+	}
+	if err := parseCodexEventsWithBudget(ctx, started.stdout, opts.OnChunk, &usage, &lastMessage, &codexErr, &threadID, metrics, inputLimit); err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
 		retErr := fmt.Errorf("codex parse events: %w", err)
@@ -134,6 +203,11 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 
 	waitErr := started.wait()
 	stderrWG.Wait()
+	if opts.BoundedWork && strings.Contains(codexErr, "shared rollout token budget exhausted") {
+		retErr := fmt.Errorf("%w: codex native input allowance exhausted", ErrInputTokenBudget)
+		emitAgentExited(opts, "codex", pid, retErr)
+		return nil, retErr
+	}
 	if waitErr != nil {
 		detail := strings.TrimSpace(codexErr)
 		stderr := strings.TrimSpace(string(stderrBuf))
@@ -147,18 +221,7 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 		return nil, retErr
 	}
 
-	res, err := finalizeTextResult("codex", lastMessage, validationSchema, usage)
-	if res != nil {
-		res.SessionID = threadID
-		res.Resumed = resumeID != ""
-		// codex reports usage cumulatively across a resumed thread and does not
-		// surface cache-creation cost, so mark both so the pipeline records
-		// correct per-round deltas and an honest unknown for cache creation.
-		res.SessionUsageCumulative = true
-		m := metrics.metrics()
-		res.Metrics = &m
-		res.Model, res.ModelProvider = resolveCodexModel(threadID, time.Now())
-	}
+	res, err = finalizeTextResult("codex", lastMessage, validationSchema, usage)
 	err = withStructuredOutputSession(err, opts, threadID)
 	emitAgentExited(opts, "codex", pid, err)
 	return res, err
@@ -330,6 +393,10 @@ type codexUsage struct {
 // clocked by time.Now as events arrive, so a tool item's started->completed gap
 // is its real subprocess wall time.
 func parseCodexEvents(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage, lastMessage *string, codexErr *string, threadID *string, metrics *codexMetricsAccumulator) error {
+	return parseCodexEventsWithBudget(ctx, r, onChunk, usage, lastMessage, codexErr, threadID, metrics, 0)
+}
+
+func parseCodexEventsWithBudget(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage, lastMessage *string, codexErr *string, threadID *string, metrics *codexMetricsAccumulator, maxInputTokens int) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024*1024)
 
@@ -383,6 +450,9 @@ func parseCodexEvents(ctx context.Context, r io.Reader, onChunk func(string), us
 					ReasoningReported: true,
 					Reported:          true,
 				})
+				if maxInputTokens > 0 && usage.InputTokens > maxInputTokens {
+					return fmt.Errorf("%w: codex consumed %d of %d input tokens", ErrInputTokenBudget, usage.InputTokens, maxInputTokens)
+				}
 			}
 		}
 	}

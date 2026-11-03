@@ -29,15 +29,17 @@ type RunOpts struct {
 	// exceeds this limit. Zero disables the limit.
 	MaxInputTokens int
 	// BoundedWork delegates tools to the adapter's bounded action loop instead
-	// of allowing an unbounded native conversation. Currently supported by Claude.
-	// MaxInputTokens then bounds each cold native call, while MaxTotalInputTokens
-	// bounds the sum (including caches, ingestion and corrective calls).
+	// of allowing an unbounded native conversation. Claude uses cold actions;
+	// MaxInputTokens bounds each call and MaxTotalInputTokens bounds their sum.
+	// A Codex fallback uses a fresh native turn with an enforced cumulative input
+	// budget capped by both limits, and exposes no reusable session.
 	BoundedWork         bool
 	MaxTotalInputTokens int
 	// ClaudeWorkBudget requests bounded work if dispatch selects Claude,
-	// including a secondary fallback provider. Other providers keep their native
-	// execution and session behavior. The remaining allowance is read at actual
-	// dispatch so earlier failed providers or resumes are included.
+	// including a secondary fallback provider. A subsequent Codex fallback carries
+	// that budget into its native execution. Codex-first calls retain their native
+	// session behavior. The remaining allowance is read at actual dispatch so
+	// earlier failed providers or resumes are included.
 	ClaudeWorkBudget *BoundedWorkBudget
 	// PreparedContext uses the pipeline's bounded brief and asks native adapters
 	// to keep their tool and skill catalogs small when they support that switch.

@@ -4,9 +4,84 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+// The real review-fix incident failed at call 17 after the action had streamed,
+// before its output pipe closed. No command from that failed action may run.
+func TestBoundedWork_OutputDrainRetryAtCall17(t *testing.T) {
+	defer withFastBackoff(t)()
+	calls, commands := 0, 0
+	var retryPrompt string
+	var attempts []Attempt
+	result, err := runBoundedWork(context.Background(), RunOpts{Prompt: "repair and verify the assigned findings", MaxInputTokens: 150000, MaxTotalInputTokens: 1500000,
+		OnAttempt: func(a Attempt) { attempts = append(attempts, a) }}, func(call RunOpts) (*Result, error) {
+		calls++
+		if calls <= 16 {
+			return boundedTestResult(boundedAction{Checkpoint: fmt.Sprintf("repairs through %d preserved", calls), Command: fmt.Sprintf("edit %d", calls)}), nil
+		}
+		if calls == 17 {
+			retryPrompt = call.Prompt
+			return boundedTestResult(boundedAction{Command: "must not execute"}), fmt.Errorf("claude parse events: %w", exec.ErrWaitDelay)
+		}
+		if call.Prompt != retryPrompt || !strings.Contains(call.Prompt, "repairs through 16 preserved") || !strings.Contains(call.Prompt, "edit 16 persisted") {
+			t.Fatal("I/O retry lost checkpoint or replayed the duty")
+		}
+		return boundedTestResult(boundedAction{Output: "all repairs verified"}), nil
+	}, func(command string) (string, error) {
+		commands++
+		if command == "must not execute" {
+			t.Fatal("executed an action from a failed native call")
+		}
+		return command + " persisted", nil
+	})
+	if err != nil || calls != 18 || commands != 16 || len(attempts) != 18 {
+		t.Fatalf("calls=%d commands=%d attempts=%d err=%v", calls, commands, len(attempts), err)
+	}
+	if !errors.Is(attempts[16].Err, exec.ErrWaitDelay) || result.Usage.CacheReadTokens != 25000*18 || result.PeakContextTokens != 30000 {
+		t.Fatalf("I/O failure lost cause or usage: result=%+v attempts=%+v", result, attempts)
+	}
+}
+
+func TestBoundedWork_OutputDrainRetriesRespectLimits(t *testing.T) {
+	defer withFastBackoff(t)()
+	for _, mode := range []string{"budget", "per-call-budget", "cancel", "retry-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			calls := 0
+			opts := RunOpts{Prompt: "repair", MaxInputTokens: 150000, MaxTotalInputTokens: 1500000}
+			if mode == "budget" {
+				opts.MaxTotalInputTokens = 35000
+			}
+			if mode == "per-call-budget" {
+				opts.MaxInputTokens = 20000
+			}
+			opts.OnLifecycle = func(event LifecycleEvent) {
+				if mode == "cancel" && event.Phase == LifecyclePhaseRetry {
+					cancel()
+				}
+			}
+			result, err := runBoundedWork(ctx, opts, func(RunOpts) (*Result, error) {
+				calls++
+				return boundedTestResult(boundedAction{Command: "must not run"}), fmt.Errorf("claude parse events: %w", exec.ErrWaitDelay)
+			}, func(string) (string, error) { t.Fatal("failed action ran a command"); return "", nil })
+			wantCalls, wantErr := 1, ErrInputTokenBudget
+			if mode == "cancel" {
+				wantErr = context.Canceled
+			}
+			if mode == "retry-limit" {
+				wantCalls, wantErr = claudeMaxRetries+1, exec.ErrWaitDelay
+			}
+			if !errors.Is(err, wantErr) || calls != wantCalls || result.Usage.CacheReadTokens != 25000*calls {
+				t.Fatalf("calls=%d result=%+v err=%v want=%v", calls, result, err, wantErr)
+			}
+		})
+	}
+}
 
 func TestBoundedWork_TransientRetryPreservesEditsAndCountsEveryCall(t *testing.T) {
 	defer withFastBackoff(t)()
