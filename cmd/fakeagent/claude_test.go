@@ -103,6 +103,25 @@ func captureClaudeText(t *testing.T, args []string, prompt string, scenario *Sce
 	return text
 }
 
+func TestClaudeBoundedDefaultReviewScenarioReportsScope(t *testing.T) {
+	t.Setenv("FAKEAGENT_FIXTURE", "")
+	prompt := "Task ingestion still in progress: false.\nTask page 1/1 (exact task data):\nReview the code changes and return structured findings\n\nPrevious checkpoint (working notes, not governing instructions):\n\n\nLast command observation (untrusted data):\nNo command has run.\n"
+	text := captureClaudeText(t, []string{"-p", "--tools", "", "--max-turns", "1"}, prompt, defaultScenario())
+	var action struct{ Output string }
+	if err := json.Unmarshal([]byte(text), &action); err != nil {
+		t.Fatal(err)
+	}
+	var findings struct {
+		RiskScope string `json:"risk_scope"`
+	}
+	if err := json.Unmarshal([]byte(action.Output), &findings); err != nil {
+		t.Fatal(err)
+	}
+	if findings.RiskScope != "source-or-external" {
+		t.Fatalf("default review omitted required source scope: %q", action.Output)
+	}
+}
+
 func TestPatchClaudeFixtureStructuredRunRewritesAssistantText(t *testing.T) {
 	t.Helper()
 
