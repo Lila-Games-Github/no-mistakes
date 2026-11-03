@@ -57,6 +57,8 @@ func handleFakeCLI(mode string) {
 	logFakeCLIStdinBody(args, logFile)
 
 	switch mode {
+	case "bounded-claude":
+		fakeBoundedClaudeHandler()
 	case "gh":
 		fakeGHHandler(args)
 	case "glab":

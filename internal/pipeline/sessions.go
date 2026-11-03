@@ -105,6 +105,14 @@ func NewRunSessions(database *db.DB, runID string, sessionAgent agent.Agent, ena
 // session when the adapter supports it. logf (optional) receives operator-
 // visible notes about session reuse and fallbacks.
 func (rs *RunSessions) Run(ctx context.Context, a agent.Agent, role SessionRole, opts agent.RunOpts, logf func(string)) (*agent.Result, error) {
+	if rs != nil && (opts.BoundedWork || (opts.ClaudeWorkBudget != nil && rs.id(role).Agent == "claude")) {
+		// A bounded checkpoint replaces Claude's native fixer transcript,
+		// including recovered identities minted before this policy applied.
+		// Other providers retain their own session behavior.
+		rs.forget(role)
+		opts.Session = nil
+		return a.Run(ctx, opts)
+	}
 	if rs == nil || !rs.enabled || !agent.SupportsSessionResume(a) {
 		if rs != nil && rs.enabled && logf != nil {
 			logf(fmt.Sprintf("agent %s does not support session resume; running cold", a.Name()))

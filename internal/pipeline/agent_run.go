@@ -86,7 +86,22 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 			if limit <= 0 {
 				return nil, fmt.Errorf("%w: run consumed %d of %d input tokens", agent.ErrInputTokenBudget, spent, defaultRunInputBudget)
 			}
-			if sctx.StepName == types.StepReview && limit > defaultReviewInputBudget {
+			// The actual provider may differ from the wrapper's primary name.
+			// Carry Claude's policy through dispatch and refresh the allowance
+			// after any failed provider or fixer resume, whose usage is recorded.
+			if sctx.StepName == types.StepReview || sctx.StepName == types.StepCI {
+				opts.ClaudeWorkBudget = &agent.BoundedWorkBudget{
+					MaxInputTokens: defaultReviewInputBudget,
+					RemainingInputTokens: func() (int, error) {
+						spent, err := sctx.recordedRunInputTokens()
+						return defaultRunInputBudget - spent, err
+					},
+				}
+			}
+			if opts.BoundedWork {
+				opts.MaxTotalInputTokens = limit
+			}
+			if (sctx.StepName == types.StepReview || opts.BoundedWork) && limit > defaultReviewInputBudget {
 				limit = defaultReviewInputBudget
 			}
 			if opts.MaxInputTokens == 0 || opts.MaxInputTokens > limit {
@@ -107,9 +122,19 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		return nil, err
 	}
 	if opts.MaxInputTokens > 0 && result != nil && result.UsageReported {
-		used := invocationInputTokens(ag.Name(), result.Usage)
-		if used > opts.MaxInputTokens {
-			return nil, fmt.Errorf("%w: call consumed %d of %d input tokens", agent.ErrInputTokenBudget, used, opts.MaxInputTokens)
+		provider := sessionProvider(ag, result)
+		limit := opts.MaxInputTokens
+		bounded := opts.BoundedWork
+		if provider == "claude" && opts.ClaudeWorkBudget != nil {
+			bounded = true
+			limit = min(limit, opts.ClaudeWorkBudget.MaxInputTokens)
+		}
+		used := invocationInputTokens(provider, result.Usage)
+		if bounded && result.PeakContextTokens > 0 {
+			used = result.PeakContextTokens
+		}
+		if used > limit {
+			return nil, fmt.Errorf("%w: call consumed %d of %d input tokens", agent.ErrInputTokenBudget, used, limit)
 		}
 	}
 	return result, nil

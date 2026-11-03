@@ -25,18 +25,30 @@ func TestPreparedContextBriefJourney(t *testing.T) {
 			t.Fatalf("review prompt omitted %q", want)
 		}
 	}
-	foundSwitch := false
+	foundReview := false
 	for _, inv := range h.AgentInvocations() {
 		if !strings.Contains(inv.Prompt, reviewStepPromptMarker) {
 			continue
 		}
-		for i := 0; i+1 < len(inv.Args); i++ {
-			if inv.Args[i] == "--setting-sources" && inv.Args[i+1] == "user" {
-				foundSwitch = true
+		foundReview = true
+		safe, oneTurn, toolFree := false, false, false
+		for i, arg := range inv.Args {
+			if arg == "--safe-mode" {
+				safe = true
+			}
+			if i+1 < len(inv.Args) {
+				oneTurn = oneTurn || arg == "--max-turns" && inv.Args[i+1] == "1"
+				toolFree = toolFree || arg == "--tools" && inv.Args[i+1] == ""
+			}
+			if arg == "--resume" || arg == "--json-schema" {
+				t.Fatalf("bounded review used a native session or output tool: %v", inv.Args)
 			}
 		}
+		if !safe || !oneTurn || !toolFree {
+			t.Fatalf("review omitted safe cold-call controls: %v", inv.Args)
+		}
 	}
-	if !foundSwitch {
-		t.Fatal("review invocation did not suppress repository instruction loading")
+	if !foundReview {
+		t.Fatal("no bounded review invocation recorded")
 	}
 }

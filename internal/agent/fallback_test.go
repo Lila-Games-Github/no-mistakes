@@ -74,6 +74,28 @@ func TestFallbackAgentRejectsUnsupportedReviewModelFallback(t *testing.T) {
 	}
 }
 
+func TestFallbackAgent_BoundedClaudeCannotSwitchToUnsupportedProvider(t *testing.T) {
+	for _, policy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "explicit", true: "dispatch-policy"}[policy], func(t *testing.T) {
+			first := &fallbackTestAgent{name: "claude", run: func() (*Result, error) {
+				return nil, errors.New("claude start: executable not found")
+			}}
+			second := &fallbackTestAgent{name: "codex", run: func() (*Result, error) {
+				t.Fatal("bounded duty fell through to an unsupported provider")
+				return nil, nil
+			}}
+			opts := RunOpts{BoundedWork: !policy}
+			if policy {
+				opts.ClaudeWorkBudget = &BoundedWorkBudget{MaxInputTokens: 150000, RemainingInputTokens: func() (int, error) { return 1500000, nil }}
+			}
+			_, err := NewFallback([]Agent{first, second}).Run(context.Background(), opts)
+			if err == nil || !strings.Contains(err.Error(), "cannot honor bounded Claude work") || first.calls != 1 || second.calls != 0 {
+				t.Fatalf("calls=%d/%d err=%v", first.calls, second.calls, err)
+			}
+		})
+	}
+}
+
 func TestFallbackAgentDoesNotFallBackOnFindingsResult(t *testing.T) {
 	first := &fallbackTestAgent{
 		name: "codex",
