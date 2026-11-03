@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -43,6 +45,41 @@ func TestGateStepCannotStartRecursivePipeline(t *testing.T) {
 		t.Run(adapter.name, func(t *testing.T) {
 			runRecursiveIncident(t, adapter.agent, adapter.executable, adapter.expectedPhase, adapter.completes)
 		})
+	}
+}
+
+func TestRecursiveIncidentMissingLogReportsBoundedDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	h := &Harness{NMHome: root, AgentLog: filepath.Join(root, "fakeagent.log")}
+	if err := os.MkdirAll(filepath.Join(root, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "logs", "daemon.log"), []byte(strings.Repeat("x", 9000)+"daemon failure marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invocations := `{"agent":"claude","args":["old"],"prompt":"unrelated"}` + "\n" +
+		`{"agent":"acpx","args":["fixture"],"prompt":"adapter failure marker","cwd":"/tmp/fixture"}` + "\n"
+	if err := os.WriteFile(h.AgentLog, []byte(invocations), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runErr := "outer failure marker"
+	stepErr := "review failure marker"
+	outer := &ipc.RunInfo{
+		ID: "outer-run", Status: types.RunFailed, Error: &runErr,
+		Steps: []ipc.StepResultInfo{{StepName: types.StepReview, Status: types.StepStatusFailed, Error: &stepErr}},
+	}
+	_, err := readIncidentAttemptLog(filepath.Join(root, "missing-incident-attempts.log"), h, outer, "explicit-acp", "acpx")
+	if err == nil {
+		t.Fatal("missing incident log succeeded")
+	}
+	got := err.Error()
+	for _, want := range []string{"missing-incident-attempts.log", "outer-run", "outer failure marker", "review", "failed", "review failure marker", "daemon failure marker", "explicit-acp", "acpx", "adapter failure marker"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("diagnostics missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "unrelated") || strings.Contains(got, strings.Repeat("x", 9000)) {
+		t.Errorf("diagnostics included unrelated invocation or unbounded daemon log:\n%s", got)
 	}
 }
 
@@ -78,9 +115,9 @@ func runRecursiveIncident(t *testing.T, agentName, executable, expectedPhase str
 		t.Fatalf("outer run status = %s, want %s (error=%v)", outer.Status, expectedStatus, outer.Error)
 	}
 
-	attempts, err := os.ReadFile(attemptLog)
+	attempts, err := readIncidentAttemptLog(attemptLog, h, outer, agentName, executable)
 	if err != nil {
-		t.Fatalf("read incident attempt log: %v", err)
+		t.Fatal(err)
 	}
 	output := string(attempts)
 	for _, label := range []string{
@@ -171,6 +208,58 @@ func runRecursiveIncident(t *testing.T, agentName, executable, expectedPhase str
 	if _, err := os.Stat(filepath.Join(h.NMHome, "repos", "recursive")); !os.IsNotExist(err) {
 		t.Fatalf("recursive gate artifact exists after refusal: %v", err)
 	}
+}
+
+// readIncidentAttemptLog keeps the normal result unchanged. On a missing log,
+// collect the evidence before Harness cleanup removes the temporary daemon.
+func readIncidentAttemptLog(path string, h *Harness, outer *ipc.RunInfo, agentName, executable string) ([]byte, error) {
+	attempts, err := os.ReadFile(path)
+	if err == nil {
+		return attempts, nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "read incident attempt log: %v\nadapter: %s (executable: %s)\n", err, agentName, executable)
+	fmt.Fprintf(&b, "outer run: %s status=%s error=%s\n", outer.ID, outer.Status, incidentDiagnosticValue(outer.Error))
+	for _, step := range outer.Steps {
+		fmt.Fprintf(&b, "step %s: status=%s error=%s\n", step.StepName, step.Status, incidentDiagnosticValue(step.Error))
+	}
+	for _, candidate := range []string{filepath.Join(h.NMHome, "logs", "daemon.log"), filepath.Join(h.NMHome, "daemon.log")} {
+		data, readErr := os.ReadFile(candidate)
+		if readErr == nil {
+			fmt.Fprintf(&b, "daemon log tail (last 8KB):\n%s\n", tailBytes(data, 8192))
+			break
+		}
+	}
+	data, readErr := os.ReadFile(h.AgentLog)
+	if readErr != nil {
+		fmt.Fprintf(&b, "recorded fake-agent invocation: unavailable (%v)\n", readErr)
+	} else {
+		var selected *Invocation
+		for _, line := range strings.Split(string(data), "\n") {
+			var inv Invocation
+			if json.Unmarshal([]byte(line), &inv) == nil && inv.Agent == executable {
+				selected = &inv
+			}
+		}
+		if selected == nil {
+			fmt.Fprintf(&b, "recorded fake-agent invocation for %s: none\n", executable)
+		} else {
+			fmt.Fprintf(&b, "recorded fake-agent invocation for %s: args=%s cwd=%s prompt=%s\n",
+				executable, incidentTail(fmt.Sprint(selected.Args), 2048), incidentTail(selected.CWD, 1024), incidentTail(selected.Prompt, 2048))
+		}
+	}
+	return nil, fmt.Errorf("%s", b.String())
+}
+
+func incidentDiagnosticValue(value *string) string {
+	if value == nil {
+		return "<none>"
+	}
+	return incidentTail(*value, 2048)
+}
+
+func incidentTail(value string, limit int) string {
+	return string(tailBytes([]byte(value), limit))
 }
 
 func incidentAttemptSection(output, label string) string {
