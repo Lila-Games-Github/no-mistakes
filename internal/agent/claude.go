@@ -78,12 +78,13 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	return a.runOnceWithTools(ctx, opts, false)
 }
 
-func (a *claudeAgent) runOnceWithTools(ctx context.Context, opts RunOpts, singleAction bool) (*Result, error) {
+func (a *claudeAgent) runOnceWithTools(ctx context.Context, opts RunOpts, singleAction bool) (res *Result, err error) {
 	if singleAction {
 		for _, arg := range a.extraArgs {
 			flag := strings.SplitN(arg, "=", 2)[0]
 			switch flag {
-			case "--resume", "--continue", "-c", "-r", "--session-id", "--append-system-prompt", "--append-system-prompt-file", "--system-prompt-file", "--agents", "--agent", "--json-schema", "--tools":
+			case "--resume", "--continue", "-c", "-r", "--session-id", "--from-pr", "--teleport", "--fork-session", "--cloud",
+				"--append-system-prompt", "--append-system-prompt-file", "--system-prompt-file", "--agents", "--agent", "--json-schema", "--tools":
 				return nil, fmt.Errorf("bounded Claude work cannot honor context-expanding agent_args_override flag %s", flag)
 			}
 		}
@@ -135,16 +136,30 @@ func (a *claudeAgent) runOnceWithTools(ctx context.Context, opts RunOpts, single
 	}()
 
 	var usage TokenUsage
-	var result *claudeResult
+	// Keep a stream snapshot even if parsing or the native process fails before
+	// the final event. Known consumption must survive every failure path.
+	result := &claudeResult{}
 	var metrics InvocationMetrics
+	defer func() {
+		if res == nil {
+			res = &Result{Text: result.text}
+		}
+		res.Usage = usage
+		res.UsageReported = usage.Reported
+		res.CacheCreationReported = usage.CacheCreationReported
+		res.Metrics = &metrics
+		res.SessionID = result.sessionID
+		res.Resumed = resumeID != ""
+		res.Model = result.model
+		if result.model != "" {
+			res.ModelProvider = "anthropic"
+		}
+	}()
 	if err := parseClaudeEventsDetailed(ctx, started.stdout, opts.OnChunk, &usage, &result, &metrics, opts.MaxInputTokens); err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
 		retErr := fmt.Errorf("claude parse events: %w", err)
 		emitAgentExited(opts, "claude", pid, retErr)
-		if errors.Is(err, ErrInputTokenBudget) {
-			return &Result{Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported, Metrics: &metrics}, retErr
-		}
 		return nil, retErr
 	}
 
@@ -156,28 +171,13 @@ func (a *claudeAgent) runOnceWithTools(ctx context.Context, opts RunOpts, single
 		return nil, retErr
 	}
 
-	if result == nil {
+	if len(result.rawEvent) == 0 {
 		retErr := fmt.Errorf("claude returned no result event")
 		emitAgentExited(opts, "claude", pid, retErr)
 		return nil, retErr
 	}
 
-	res, err := finalizeClaudeResult(result, opts.JSONSchema, usage)
-	if res != nil {
-		res.Metrics = &metrics
-		res.SessionID = result.sessionID
-		res.Resumed = resumeID != ""
-		res.Model = result.model
-		// Claude reports cache-creation cost per message, so the accumulated
-		// value is meaningful (recorded as a real number, not unknown). Its
-		// stream-json usage is per-invocation, not cumulative across --resume,
-		// so SessionUsageCumulative stays false and per-round deltas equal the
-		// raw counters.
-		res.CacheCreationReported = res.UsageReported
-		if result.model != "" {
-			res.ModelProvider = "anthropic"
-		}
-	}
+	res, err = finalizeClaudeResult(result, opts.JSONSchema, usage)
 	if errors.Is(err, errNoStructuredOutput) && opts.OnChunk != nil {
 		opts.OnChunk(fmt.Sprintf("structured output missing: subtype=%s, text_len=%d, input_tokens=%d, output_tokens=%d",
 			result.Subtype, len(result.text), usage.InputTokens, usage.OutputTokens))
@@ -395,6 +395,14 @@ func parseClaudeEventsDetailed(ctx context.Context, r io.Reader, onChunk func(st
 	unnamedMessage := 0
 	totalInput := 0
 	defer func() {
+		// A caller can seed a snapshot to retain identity/text without a final
+		// result event. rawEvent still distinguishes completion from a partial
+		// stream; never synthesize a successful result on EOF or cancellation.
+		if result != nil && *result != nil {
+			(*result).text = textBuf
+			(*result).sessionID = lastSessionID
+			(*result).model = lastModel
+		}
 		for _, u := range seenMessages {
 			usage.Add(TokenUsage{
 				InputTokens:           u.InputTokens,

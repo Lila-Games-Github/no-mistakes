@@ -146,10 +146,14 @@ func TestBoundedWork_CorrectiveCallKeepsUsageWithoutReplayingTools(t *testing.T)
 }
 
 func TestClaudeAgent_BoundedModeRejectsNativeResumeOverride(t *testing.T) {
-	a := &claudeAgent{bin: "must-not-be-started", extraArgs: []string{"--resume", "foreign-review-session"}}
-	_, err := a.Run(context.Background(), RunOpts{Prompt: "review", BoundedWork: true, MaxInputTokens: 150000, MaxTotalInputTokens: 1500000})
-	if err == nil || !strings.Contains(err.Error(), "context-expanding agent_args_override flag --resume") {
-		t.Fatalf("unsafe override = %v", err)
+	for _, flag := range []string{"--resume", "--continue", "-c", "-r", "--session-id", "--from-pr", "--teleport", "--fork-session", "--cloud"} {
+		for _, args := range [][]string{{flag, "foreign-review-session"}, {flag + "=foreign-review-session"}} {
+			a := &claudeAgent{bin: "must-not-be-started", extraArgs: args}
+			_, err := a.Run(context.Background(), RunOpts{Prompt: "review", BoundedWork: true, MaxInputTokens: 150000, MaxTotalInputTokens: 1500000})
+			if err == nil || !strings.Contains(err.Error(), "context-expanding agent_args_override flag "+flag) {
+				t.Fatalf("unsafe override %v = %v", args, err)
+			}
+		}
 	}
 }
 

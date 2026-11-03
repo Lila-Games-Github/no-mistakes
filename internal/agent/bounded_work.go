@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
+	"github.com/kunchenguid/no-mistakes/internal/runmetrics"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 )
 
@@ -49,9 +50,9 @@ type boundedAction struct {
 // ingested in exact UTF-8 pages before any command or final result is allowed,
 // and every page remains available for rereading throughout the duty.
 //
-// This is deliberately outside the native retry/session machinery. A repair
-// command can have side effects, so continuing preserves the existing worktree
-// and its checkpoint, never replays an earlier command or resets the checkout.
+// Retries belong to the current tool-free model action, never the whole duty.
+// A repair command can have side effects, so continuing preserves the existing
+// worktree and its checkpoint, never replays a command or resets the checkout.
 func (a *claudeAgent) runBoundedWork(ctx context.Context, opts RunOpts) (*Result, error) {
 	return runBoundedWork(ctx, opts, func(call RunOpts) (*Result, error) {
 		return a.runOnceWithTools(ctx, call, true)
@@ -74,12 +75,17 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 	combined := &Result{}
 	spent := 0
 	corrections := 0
+	retries := 0
+	finalCorrection := false
 	seen := map[[32]byte]int{}
 	for calls := 0; calls < boundedMaxCalls; calls++ {
 		if err := ctx.Err(); err != nil {
 			return combined, err
 		}
 		prompt := boundedWorkPrompt(pages[page], page+1, len(pages), ingested < len(pages)-1, checkpoint, observation)
+		if finalCorrection {
+			prompt += "\nFinal-output correction only: command MUST remain empty. Reformat the prior response without redoing work, changing files, or dropping any finding.\n"
+		}
 		if len(prompt) > boundedPromptBytes {
 			return combined, fmt.Errorf("bounded work prompt exceeds %d bytes", boundedPromptBytes)
 		}
@@ -97,6 +103,7 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 		call.Prompt, call.JSONSchema, call.Session = prompt, nil, nil
 		call.MaxInputTokens, call.MaxTotalInputTokens = limit, 0
 		call.PreparedContext = true
+		call.StructuredOutputReask = finalCorrection
 		start := time.Now()
 		result, callErr := model(call)
 		used := 0
@@ -115,8 +122,8 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 		if ctx.Err() != nil {
 			callErr = ctx.Err()
 		}
-		if callErr == nil && used > limit {
-			callErr = fmt.Errorf("%w: bounded call consumed %d of %d", ErrInputTokenBudget, used, limit)
+		if used > limit {
+			callErr = errors.Join(callErr, fmt.Errorf("%w: bounded call consumed %d of %d", ErrInputTokenBudget, used, limit))
 		}
 		var action boundedAction
 		protocolErr := false
@@ -133,14 +140,36 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 		}
 		if callErr != nil {
 			emitAgentAttempt(call, "claude", result, callErr, start, time.Now())
+			// This native call cannot have run tools. Retry its identical prompt
+			// only, accounting for failed-call input before the next preflight.
+			if !protocolErr && !errors.Is(callErr, ErrInputTokenBudget) && retries < claudeMaxRetries {
+				if label, retry := classifyTransient(callErr); retry {
+					retries++
+					emitAgentRetry(call, "claude", label, retries+1, claudeMaxRetries+1)
+					finishWait := runmetrics.Start(ctx, runmetrics.BackoffWait)
+					backoffErr := transientBackoff(ctx, retries)
+					finishWait(backoffErr, nil, runmetrics.Input{})
+					if backoffErr != nil {
+						return combined, backoffErr
+					}
+					continue
+				}
+			}
 			if protocolErr && corrections == 0 {
 				// No command was executed. Repair the response in a fresh bounded
 				// call, carrying the last good checkpoint rather than replaying work.
 				corrections++
+				retries = 0
 				observation = "Your action JSON was rejected: " + outputSnippet(callErr.Error()) + ". Return a smaller valid action object. Rejected text: " + outputSnippet(result.Text)
 				continue
 			}
 			return combined, fmt.Errorf("bounded work call %d: %w", calls+1, callErr)
+		}
+		retries = 0
+		if finalCorrection && action.Command != "" {
+			err = errors.New("bounded final-output correction cannot execute commands")
+			emitAgentAttempt(call, "claude", result, err, start, time.Now())
+			return combined, err
 		}
 		checkpoint = action.Checkpoint
 		// Ingestion is ordered and complete; a model cannot silently finish on
@@ -191,14 +220,33 @@ func runBoundedWork(ctx context.Context, opts RunOpts, model func(RunOpts) (*Res
 				}
 			}
 			if err == nil && action.Output != "" {
-				combined.Text = action.Output
-				if len(opts.JSONSchema) > 0 {
-					combined.Output, err = parseStructuredTextOutput(action.Output, opts.JSONSchema)
+				var final *Result
+				final, err = finalizeTextResult("claude", action.Output, opts.JSONSchema, TokenUsage{})
+				if err == nil {
+					combined.Text, combined.Output = final.Text, final.Output
+					combined.StructuredOutputRepaired = final.StructuredOutputRepaired
+					result.StructuredOutputRepaired = final.StructuredOutputRepaired
 				}
 			}
 		}
 		emitAgentAttempt(call, "claude", result, err, start, time.Now())
 		if err != nil {
+			var soErr *StructuredOutputError
+			if !finalCorrection && ctx.Err() == nil && errors.As(err, &soErr) {
+				// Preserve the COMPLETE rejected response, even when it needs
+				// several pages. A short observation snippet could lose findings.
+				// This is formatting only: commands are forbidden by the runner.
+				emitStructuredOutputReask(opts, "claude", soErr)
+				pages, err = boundedTaskPages(structuredOutputReaskPrompt(soErr, opts.JSONSchema, false))
+				if err != nil {
+					return combined, err
+				}
+				page, ingested = 0, 0
+				finalCorrection = true
+				combined.StructuredOutputReasks++
+				observation = "The work is complete. Correct only the final response format using the exact response and schema in the task pages."
+				continue
+			}
 			return combined, err
 		}
 		if action.Output != "" {
