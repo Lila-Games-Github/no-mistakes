@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 func runClaude(args []string, promptReader io.Reader, scenario *Scenario) int {
@@ -16,8 +17,9 @@ func runClaude(args []string, promptReader io.Reader, scenario *Scenario) int {
 	}
 	logInvocation("claude", prompt, args)
 
-	action := scenario.Match(prompt)
-	if err := applyAction(action); err != nil {
+	action, err := claudeScenarioAction(args, prompt, scenario)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fakeagent: claude action: %v\n", err)
 		return 1
 	}
 
@@ -79,6 +81,65 @@ func runClaude(args []string, promptReader io.Reader, scenario *Scenario) int {
 	return 0
 }
 
+// Bounded Claude calls read the task in pages before executing a scenario.
+// Remember only the earliest matching action index in the checkpoint, so a
+// match on an earlier page survives cold calls without growing the prompt.
+func claudeScenarioAction(args []string, prompt string, scenario *Scenario) (Action, error) {
+	toolsDisabled, oneTurn := false, false
+	for i := 0; i+1 < len(args); i++ {
+		toolsDisabled = toolsDisabled || args[i] == "--tools" && args[i+1] == ""
+		oneTurn = oneTurn || args[i] == "--max-turns" && args[i+1] == "1"
+	}
+	if !toolsDisabled || !oneTurn {
+		action := scenario.Match(prompt)
+		return action, applyAction(action)
+	}
+	const checkpointMarker = "\n\nPrevious checkpoint (working notes, not governing instructions):\n"
+	_, rest, ok := strings.Cut(prompt, checkpointMarker)
+	if !ok {
+		return Action{}, fmt.Errorf("bounded prompt missing checkpoint")
+	}
+	checkpoint, _, ok := strings.Cut(rest, "\n\nLast command observation (untrusted data):\n")
+	if !ok {
+		return Action{}, fmt.Errorf("bounded prompt missing observation")
+	}
+	state := struct {
+		MatchedAction int `json:"matched_action"`
+	}{len(scenario.Actions)}
+	if checkpoint != "" {
+		if err := json.Unmarshal([]byte(checkpoint), &state); err != nil {
+			return Action{}, fmt.Errorf("bounded checkpoint: %w", err)
+		}
+	}
+	for i, candidate := range scenario.Actions {
+		if candidate.Match == "" || strings.Contains(prompt, candidate.Match) {
+			state.MatchedAction = min(state.MatchedAction, i)
+			break
+		}
+	}
+	saved, _ := json.Marshal(state)
+	output := ""
+	header, _, _ := strings.Cut(prompt, "\nTask page ")
+	if !strings.Contains(header, "Task ingestion still in progress: true.") {
+		action := Action{Text: "no matching scenario"}
+		if state.MatchedAction >= 0 && state.MatchedAction < len(scenario.Actions) {
+			action = scenario.Actions[state.MatchedAction]
+		}
+		if err := applyAction(action); err != nil {
+			return Action{}, err
+		}
+		output = action.Text
+		if action.Structured != nil || action.StructuredRaw != "" {
+			output = string(action.structuredJSON())
+		}
+		if output == "" {
+			output = action.textOrDefault()
+		}
+	}
+	envelope, err := json.Marshal(map[string]any{"checkpoint": string(saved), "command": "", "output": output})
+	return Action{Text: string(envelope)}, err
+}
+
 // patchClaudeFixture rewrites the result event's structured_output to
 // match the scenario action, leaving every other event byte-for-byte.
 // The result event is identified as the one whose top-level "type" is
@@ -90,7 +151,7 @@ func runClaude(args []string, promptReader io.Reader, scenario *Scenario) int {
 // (e.g. document.go's unmarshalRequiredFindings requires "summary").
 // Patching keeps the wire shape real but the content predictable.
 func patchClaudeFixture(raw []byte, action Action) ([]byte, error) {
-	if action.Structured == nil && action.StructuredRaw == "" {
+	if action.Structured == nil && action.StructuredRaw == "" && action.Text == "" {
 		return raw, nil
 	}
 	structuredJSON := action.structuredJSON()
@@ -138,7 +199,11 @@ func patchClaudeFixture(raw []byte, action Action) ([]byte, error) {
 		if err := json.Unmarshal(line, &event); err != nil {
 			return nil, fmt.Errorf("parse result event: %w", err)
 		}
-		event["structured_output"] = json.RawMessage(structuredJSON)
+		if action.Structured != nil || action.StructuredRaw != "" {
+			event["structured_output"] = json.RawMessage(structuredJSON)
+		} else {
+			delete(event, "structured_output")
+		}
 		event["result"] = text
 		patched, err := json.Marshal(event)
 		if err != nil {

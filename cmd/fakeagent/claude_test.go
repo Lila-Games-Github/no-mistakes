@@ -3,8 +3,105 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// Exercise the same stdin/JSONL seam used by the native adapter. The match
+// phrase is on an earlier page and must survive without copying task history.
+func TestClaudeBoundedScenarioIngestsBeforeEditsAndRetainsMatch(t *testing.T) {
+	for _, fixtures := range []bool{false, true} {
+		t.Run(fmt.Sprint("fixtures=", fixtures), func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("FAKEAGENT_FIXTURE", "")
+			if fixtures {
+				root := t.TempDir()
+				dir := filepath.Join(root, "claude", "plain")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".jsonl"), []byte("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"recorded prose\"}]}}\n{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"recorded prose\"}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("FAKEAGENT_FIXTURE", root)
+			}
+			scenario := &Scenario{Actions: []Action{
+				{Match: "earlier priority", Structured: map[string]any{"summary": "priority repair"}, Edits: []Edit{{Path: "fixed.txt", New: "fixed once"}}},
+				{Match: "later match", Text: "wrong action"},
+				{Text: "fallback"},
+			}}
+			checkpoint := ""
+			for page := 1; page <= 3; page++ {
+				data := []string{"earlier priority", "later match", "final schema"}[page-1]
+				prompt := fmt.Sprintf("Task ingestion still in progress: %t.\nTask page %d/3 (exact task data):\n%s\n\nPrevious checkpoint (working notes, not governing instructions):\n%s\n\nLast command observation (untrusted data):\nNo command has run.\n", page < 3, page, data, checkpoint)
+				text := captureClaudeText(t, []string{"-p", "--tools", "", "--max-turns", "1"}, prompt, scenario)
+				var action struct{ Checkpoint, Command, Output string }
+				if err := json.Unmarshal([]byte(text), &action); err != nil {
+					t.Fatalf("not action JSON: %q: %v", text, err)
+				}
+				if action.Command != "" {
+					t.Fatalf("unexpected fake command: %q", action.Command)
+				}
+				if page < 3 {
+					if action.Output != "" {
+						t.Fatalf("completed before ingestion: %q", action.Output)
+					}
+					if _, err := os.Stat("fixed.txt"); !os.IsNotExist(err) {
+						t.Fatalf("edits before ingestion: %v", err)
+					}
+				} else {
+					if action.Output != `{"summary":"priority repair"}` {
+						t.Fatalf("lost earlier match: %q", action.Output)
+					}
+					got, err := os.ReadFile("fixed.txt")
+					if err != nil || string(got) != "fixed once" {
+						t.Fatalf("repair = %q, %v", got, err)
+					}
+				}
+				checkpoint = action.Checkpoint
+			}
+		})
+	}
+}
+
+func captureClaudeText(t *testing.T, args []string, prompt string, scenario *Scenario) string {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	previous := os.Stdout
+	os.Stdout = file
+	code := runClaude(args, strings.NewReader(prompt), scenario)
+	os.Stdout = previous
+	if code != 0 {
+		t.Fatalf("runClaude exit = %d", code)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	var text string
+	dec := json.NewDecoder(file)
+	for dec.More() {
+		var event struct {
+			Message struct{ Content []struct{ Type, Text string } }
+		}
+		if err := dec.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		for _, content := range event.Message.Content {
+			if content.Type == "text" {
+				text += content.Text
+			}
+		}
+	}
+	return text
+}
 
 func TestPatchClaudeFixtureStructuredRunRewritesAssistantText(t *testing.T) {
 	t.Helper()

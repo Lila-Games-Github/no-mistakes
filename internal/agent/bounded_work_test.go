@@ -152,3 +152,13 @@ func TestClaudeAgent_BoundedModeRejectsNativeResumeOverride(t *testing.T) {
 		t.Fatalf("unsafe override = %v", err)
 	}
 }
+
+func TestClaudeAgent_BoundedModeRejectsStructuredOutputToolOverride(t *testing.T) {
+	for _, args := range [][]string{{"--json-schema", `{}`}, {"--json-schema={}"}} {
+		a := &claudeAgent{bin: "must-not-be-started", extraArgs: args}
+		_, err := a.Run(context.Background(), RunOpts{Prompt: "review", BoundedWork: true, MaxInputTokens: 150000, MaxTotalInputTokens: 1500000})
+		if err == nil || !strings.Contains(err.Error(), "agent_args_override flag --json-schema") {
+			t.Fatalf("structured output tool override = %v", err)
+		}
+	}
+}

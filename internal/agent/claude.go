@@ -83,7 +83,7 @@ func (a *claudeAgent) runOnceWithTools(ctx context.Context, opts RunOpts, single
 		for _, arg := range a.extraArgs {
 			flag := strings.SplitN(arg, "=", 2)[0]
 			switch flag {
-			case "--resume", "--continue", "-c", "-r", "--session-id", "--append-system-prompt", "--append-system-prompt-file", "--system-prompt-file", "--agents", "--agent":
+			case "--resume", "--continue", "-c", "-r", "--session-id", "--append-system-prompt", "--append-system-prompt-file", "--system-prompt-file", "--agents", "--agent", "--json-schema":
 				return nil, fmt.Errorf("bounded Claude work cannot honor context-expanding agent_args_override flag %s", flag)
 			}
 		}
