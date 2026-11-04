@@ -4,7 +4,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -19,6 +21,63 @@ import (
 )
 
 const nativeAgentEscapedPipeHelperEnv = "NM_AGENT_NATIVE_PIPE_HELPER"
+
+func TestClaudeAgent_BoundedWorkRetriesEscapedOutputPipe(t *testing.T) {
+	defer withFastBackoff(t)()
+	dir := t.TempDir()
+	t.Setenv("NM_CLAUDE_DRAIN_HELPER", "leader")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &claudeAgent{bin: exe, extraArgs: []string{"-test.run=^TestClaudeBoundedDrainHelper$", "--"}}
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(filepath.Join(dir, "escaped.pid")); err == nil {
+			if pid, err := strconv.Atoi(string(data)); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var attempts []Attempt
+	result, err := a.Run(ctx, RunOpts{Prompt: "repair", CWD: dir, BoundedWork: true, MaxInputTokens: 150000, MaxTotalInputTokens: 1500000,
+		OnAttempt: func(a Attempt) { attempts = append(attempts, a) }})
+	if err != nil || result == nil || result.Text != "complete" || len(attempts) != 2 || !errors.Is(attempts[0].Err, exec.ErrWaitDelay) || result.Usage.InputTokens != 200 {
+		t.Fatalf("output-drain recovery: result=%+v attempts=%+v err=%v", result, attempts, err)
+	}
+}
+
+func TestClaudeBoundedDrainHelper(t *testing.T) {
+	if os.Getenv("NM_CLAUDE_DRAIN_HELPER") != "leader" {
+		return
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	data, _ := os.ReadFile("calls")
+	n, _ := strconv.Atoi(string(data))
+	_ = os.WriteFile("calls", []byte(strconv.Itoa(n+1)), 0o644)
+	if n == 0 {
+		child := exec.Command(os.Args[0], "-test.run=^TestNativeAgentEscapedPipeHelper$")
+		cwd, err := os.Getwd()
+		if err != nil {
+			os.Exit(2)
+		}
+		child.Env = append(os.Environ(), nativeAgentEscapedPipeHelperEnv+"=escaped", "NM_AGENT_NATIVE_PIPE_READY="+filepath.Join(cwd, "ready"))
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+		_ = os.WriteFile("escaped.pid", []byte(strconv.Itoa(child.Process.Pid)), 0o644)
+		if !waitForNativeAgentPipeHelperReady("ready", 5*time.Second) {
+			os.Exit(3)
+		}
+	}
+	action, _ := json.Marshal(boundedAction{Output: "complete"})
+	event, _ := json.Marshal(map[string]any{"type": "assistant", "message": map[string]any{"id": "action", "usage": map[string]int{"input_tokens": 100}, "content": []any{map[string]string{"type": "text", "text": string(action)}}}})
+	fmt.Println(string(event))
+	fmt.Println(`{"type":"result","subtype":"success"}`)
+	os.Exit(0)
+}
 
 func TestNativeAgentCommand_WaitDelayClosesEscapedPipeHolder(t *testing.T) {
 	dir := t.TempDir()
